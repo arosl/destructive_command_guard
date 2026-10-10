@@ -6,6 +6,7 @@ This document describes packs in the `core` category.
 
 - [Core Git](#coregit)
 - [Core Filesystem](#corefilesystem)
+- [Core slb](#coreslb)
 
 ---
 
@@ -291,6 +292,49 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "core.filesystem:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Core slb
+
+**Pack ID:** `core.slb`
+
+Keeps agents from running slb requests or emergency overrides, which run a command dcg cannot see
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `slb`
+- `/slb`
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `slb-execute` | slb execute runs a stored request that dcg never judged. A human runs it. | high |
+| `slb-emergency-execute` | slb emergency-execute is a human override that bypasses approval. A human runs it. | critical |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "core.slb:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "core.slb:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

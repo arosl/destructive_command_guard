@@ -6,7 +6,9 @@
 //! - Git commands that rewrite history
 //! - Git commands that destroy stashes
 //! - Filesystem commands that recursively delete outside temp directories
+//! - slb subcommands that run a command dcg cannot see
 
 pub(crate) mod credential_files;
 pub mod filesystem;
 pub mod git;
+pub mod slb;

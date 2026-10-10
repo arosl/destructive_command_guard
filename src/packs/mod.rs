@@ -1568,7 +1568,7 @@ pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 103] = [
+static PACK_ENTRIES: [PackEntry; 104] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1768,6 +1768,7 @@ static PACK_ENTRIES: [PackEntry; 103] = [
         ],
         core::filesystem::create_pack,
     ),
+    PackEntry::new("core.slb", &["slb", "/slb"], core::slb::create_pack),
     PackEntry::new("storage.s3", &["s3", "s3api"], storage::s3::create_pack),
     PackEntry::new(
         "storage.gcs",

@@ -199,6 +199,7 @@ most catastrophic, unrecoverable mistakes:
 
 - `core.filesystem` - Dangerous recursive `rm` operations and equivalent filesystem destruction outside literal temp subdirectories *(always enabled; cannot be removed from evaluation)*
 - `core.git` - Destructive git commands that lose uncommitted work, rewrite history, or destroy stashes *(always enabled; cannot be removed from evaluation)*
+- `core.slb` - `slb execute` and `slb emergency-execute`, which run a command dcg never sees; the operands of `slb run`, `slb request` and `slb emergency-execute` are judged as commands *(always enabled; cannot be removed from evaluation)*
 - `system.disk` - `mkfs`, `dd`-to-device, `fdisk`, `parted`, `mdadm`, `lvm` removal, `wipefs` *(on by default; opt out with `disabled = ["system.disk"]`)*
 
 **"Cannot be removed" is not the same as "cannot be relaxed."** A `core.*` pack
