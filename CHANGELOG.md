@@ -11,6 +11,22 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.15.4](https://github.com/arosl/destructive_command_guard/releases/tag/v0.15.4) -- 2026-10-10 [Release]
+
+The first release of the arosl fork, for the ACFS fork's herdr-based agent
+setup. It is v0.15.3 plus:
+
+- **herdr and tmux command strings are judged.** A command passed to
+  `herdr pane run`, `tmux send-keys` and similar runs in another pane; dcg now
+  evaluates that command string instead of letting it through.
+- **`slb` runs are judged.** The command strings of `slb run`,
+  `slb request --execute` and `slb emergency-execute` are evaluated, and the
+  new always-on `core.slb` pack denies `slb execute <request-id>` and
+  `emergency-execute --yes --ack`, which run commands dcg never sees.
+- **Releases and `dcg update` come from this fork.** `install.sh`,
+  `install.ps1` and `dcg update` fetch from `arosl/destructive_command_guard`,
+  and the cosign identity follows that owner.
+
 ## [v0.15.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.3) -- 2026-10-08 [Release]
 
 This release closes commands that ran unguarded (Claude Code's `Monitor`
