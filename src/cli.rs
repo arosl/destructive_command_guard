@@ -17639,12 +17639,12 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     let requested_version = update.version.clone();
     let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
-        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.sh"
+        "https://raw.githubusercontent.com/arosl/destructive_command_guard/{normalized_tag}/install.sh"
     );
     // Releases-download URL where the DSR release contract publishes
     // install.sh.sha256.
     let sha_url = format!(
-        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.sh.sha256"
+        "https://github.com/arosl/destructive_command_guard/releases/download/{normalized_tag}/install.sh.sha256"
     );
 
     eprintln!("dcg update: downloading and verifying install.sh from {normalized_tag}.");
@@ -17924,10 +17924,10 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
     let requested_version = update.version.clone();
     let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
-        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.ps1"
+        "https://raw.githubusercontent.com/arosl/destructive_command_guard/{normalized_tag}/install.ps1"
     );
     let sha_url = format!(
-        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.ps1.sha256"
+        "https://github.com/arosl/destructive_command_guard/releases/download/{normalized_tag}/install.ps1.sha256"
     );
 
     eprintln!("dcg update: downloading and verifying install.ps1 from {normalized_tag}.");
