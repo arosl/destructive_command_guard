@@ -15,6 +15,14 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Judge command strings run in a terminal multiplexer's pane.**
+  `herdr pane run <pane> '<cmd>'`, `herdr pane send-text <pane> '<cmd>'`,
+  tmux's `new-window`, `new-session`, `split-window`, `respawn-pane`,
+  `respawn-window`, `run-shell`, `display-popup`, `if-shell` and `pipe-pane`
+  shell commands, and the keys of `tmux send-keys` were allowed when the
+  destructive command was one quoted word, while the unquoted and `bash -c`
+  forms were denied. They are now command-string runners. `herdr agent
+  prompt`, which sends text to an agent rather than a shell, stays data.
 - **Check substitutions carried by interpreter variables (#544).** Python and
   JavaScript literal values passed through variables or opaque calls now reach
   the existing command evaluator, including encoded substitution markers.
