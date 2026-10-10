@@ -208,7 +208,10 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // as for ssh, only a quote or `$` makes the payload invisible to raw
     // matching.
     // A name split by quoting (`w\atch`) is `names_a_runner_through_quoting`.
-    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
+    // `herdr pane run|send-text <pane> '<cmd>'` and tmux's shell-command
+    // subcommands (`new-window '<cmd>'`, `send-keys '<cmd>' Enter`) run the
+    // string in a pane's shell the same way.
+    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine|herdr|tmux)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -5740,6 +5743,118 @@ fn command_string_runner_payloads(
                 }
             }
         }
+        "herdr" => {
+            // `herdr [--session S|--machine M|--remote R] pane run <pane>
+            // <command>` runs the command in the pane's shell, and `pane
+            // send-text <pane> <text>` types the text into it. Each operand
+            // after the pane id is a command string, and so are they joined.
+            // `herdr agent prompt` sends text to an agent, not a shell: data.
+            let mut index = 0usize;
+            while index < words.len() && option(words[index].0) {
+                let unquoted = unquoted_word(words[index].0);
+                index += if matches!(unquoted, "--session" | "--machine" | "--remote") {
+                    2
+                } else {
+                    1
+                };
+            }
+            let subcommand = |at: usize| words.get(at).map(|(word, _)| unquoted_word(word));
+            if subcommand(index) == Some("pane")
+                && matches!(subcommand(index + 1), Some("run" | "send-text"))
+                && let Some(pane) = (index + 2..words.len()).find(|at| !option(words[*at].0))
+            {
+                let text = pane + 1;
+                for at in text..words.len() {
+                    payloads.extend(span(at, at + 1));
+                }
+                if words.len() > text + 1 {
+                    payloads.extend(span(text, words.len()));
+                }
+            }
+        }
+        "tmux" => {
+            // tmux runs the shell command given to `new-window`,
+            // `new-session`, `split-window`, `respawn-pane`, `respawn-window`,
+            // `run-shell`, `display-popup`, `if-shell` and `pipe-pane` (its
+            // first operand, and the operands joined), and `send-keys` types
+            // its keys into the pane's shell (each key, and the keys joined).
+            // The server option `-c` is a shell command too. Commands chain
+            // with a `;` word.
+            let mut index = 0usize;
+            while index < words.len() && option(words[index].0) {
+                let word = words[index].0;
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                let letters = &word[1..];
+                match letters.find(['L', 'S', 'f', 'c', 'T']) {
+                    Some(at) if at + 1 == letters.len() => {
+                        if letters.ends_with('c') {
+                            payloads.extend(span(index + 1, index + 2));
+                        }
+                        index += 2;
+                    }
+                    Some(at) => {
+                        if letters.as_bytes()[at] == b'c' {
+                            // `-c'<cmd>'`
+                            let value_start = at + 2;
+                            payloads.push(attached(
+                                &word[value_start..],
+                                words[index].1.start + value_start,
+                                words[index].1.end,
+                            ));
+                        }
+                        index += 1;
+                    }
+                    None => index += 1,
+                }
+            }
+            while index < words.len() {
+                let end = (index..words.len())
+                    .find(|at| matches!(words[*at].0, ";" | "\\;" | "';'" | "\";\""))
+                    .unwrap_or(words.len());
+                // The letters of the options that take a value, and whether
+                // every operand is a key rather than one command.
+                let (value_letters, keys) = match unquoted_word(words[index].0) {
+                    "new-window" | "neww" => ("cenFt", false),
+                    "new-session" | "new" => ("cefFnstxy", false),
+                    "split-window" | "splitw" => ("celpFt", false),
+                    "respawn-pane" | "respawnp" | "respawn-window" | "respawnw" => ("cet", false),
+                    "run-shell" | "run" => ("cdt", false),
+                    "display-popup" | "popup" => ("bcdehsStTwxy", false),
+                    "if-shell" | "if" | "pipe-pane" | "pipep" => ("t", false),
+                    "send-keys" | "send" => ("cNt", true),
+                    _ => {
+                        index = end + 1;
+                        continue;
+                    }
+                };
+                // The first operand, after the options and their values
+                // (`-n name`, `-dn name`).
+                let mut start = index + 1;
+                while start < end && option(words[start].0) {
+                    let word = words[start].0;
+                    if word == "--" {
+                        start += 1;
+                        break;
+                    }
+                    let letters = &word[1..];
+                    start += match letters.find(|letter| value_letters.contains(letter)) {
+                        Some(at) if at + 1 == letters.len() => 2,
+                        _ => 1,
+                    };
+                }
+                let singles = if keys { end } else { end.min(start + 1) };
+                for at in start..singles {
+                    payloads.extend(span(at, at + 1));
+                }
+                if end > start + 1 {
+                    payloads.extend(span(start, end));
+                }
+                index = end + 1;
+            }
+        }
         "hyperfine" => {
             // Every operand is a benchmarked command, and so are the values
             // of `--prepare`, `--setup`, `--cleanup`, `--conclude` and
@@ -6324,6 +6439,8 @@ const COMMAND_STRING_RUNNERS: &[&str] = &[
     "entr",
     "flock",
     "hyperfine",
+    "herdr",
+    "tmux",
 ];
 
 /// The option that hands each flag runner its command string.
