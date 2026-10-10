@@ -15,6 +15,15 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **Keep agents from running a command through slb.** `slb run '<cmd>'`,
+  `slb request '<cmd>' --wait --execute` and `slb emergency-execute '<cmd>'`
+  run the command in the caller's shell, and a destructive one passed as a
+  quoted word was allowed; their operands are now judged as command strings.
+  `slb execute <request-id>` runs a stored request dcg never sees, and
+  `emergency-execute --yes --ack <sha256>` needs neither approval nor a human,
+  so the new always-on `core.slb` pack denies both: a human runs them in their
+  own terminal. `slb pending`, `approve`, `status` and `review` stay allowed.
+
 - **Judge command strings run in a terminal multiplexer's pane.**
   `herdr pane run <pane> '<cmd>'`, `herdr pane send-text <pane> '<cmd>'`,
   tmux's `new-window`, `new-session`, `split-window`, `respawn-pane`,

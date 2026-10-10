@@ -211,8 +211,9 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // A name split by quoting (`w\atch`) is `names_a_runner_through_quoting`.
     // `herdr pane run|send-text <pane> '<cmd>'` and tmux's shell-command
     // subcommands (`new-window '<cmd>'`, `send-keys '<cmd>' Enter`) run the
-    // string in a pane's shell the same way.
-    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine|herdr|tmux)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
+    // string in a pane's shell the same way, and so do `slb run|request|
+    // emergency-execute '<cmd>'` in the caller's shell.
+    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine|herdr|tmux|slb)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -5857,6 +5858,75 @@ fn command_string_runner_payloads(
                 index = end + 1;
             }
         }
+        "slb" => {
+            // `slb run '<cmd>'`, `slb request '<cmd>' --wait --execute` and
+            // `slb emergency-execute '<cmd>' --yes --ack <sha256>` run the
+            // command in the caller's shell once slb lets them, and
+            // emergency-execute needs no approval at all. Each operand after
+            // the subcommand is a command string, and so are they joined.
+            // slb parses with cobra: flags may stand anywhere, `--` ends
+            // them, and these take a value unless it is attached (`--x=v`).
+            const VALUE_FLAGS: &[&str] = &[
+                "actor",
+                "config",
+                "db",
+                "output",
+                "project",
+                "session-id",
+                "attach-context",
+                "attach-file",
+                "attach-screenshot",
+                "dry-run-timeout",
+                "expected-effect",
+                "goal",
+                "queue-timeout",
+                "reason",
+                "redact",
+                "safety",
+                "timeout",
+                "ack",
+                "log-dir",
+            ];
+            let mut operands = Vec::new();
+            let mut index = 0usize;
+            while index < words.len() {
+                let word = unquoted_word(words[index].0);
+                if word == "--" {
+                    operands.extend(index + 1..words.len());
+                    break;
+                }
+                index += if !option(words[index].0) {
+                    operands.push(index);
+                    1
+                } else if let Some(long) = word.strip_prefix("--") {
+                    if VALUE_FLAGS.contains(&long) { 2 } else { 1 }
+                } else if short_cluster(word)
+                    && word[1..].find(['c', 'o', 'C', 's', 'r']) == Some(word.len() - 2)
+                {
+                    // `-c <file>`, `-s <id>`, `-r <reason>`, also last in
+                    // a cluster (`-jr <reason>`). The first such letter takes
+                    // the rest of the word when there is one (`-sabc`).
+                    2
+                } else {
+                    1
+                };
+            }
+            if let Some((&subcommand, rest)) = operands.split_first()
+                && matches!(
+                    unquoted_word(words[subcommand].0),
+                    "run" | "request" | "emergency-execute"
+                )
+            {
+                for &at in rest {
+                    payloads.extend(span(at, at + 1));
+                }
+                if let (Some(&first), Some(&last)) = (rest.first(), rest.last())
+                    && last > first
+                {
+                    payloads.extend(span(first, last + 1));
+                }
+            }
+        }
         "hyperfine" => {
             // Every operand is a benchmarked command, and so are the values
             // of `--prepare`, `--setup`, `--cleanup`, `--conclude` and
@@ -6443,6 +6513,7 @@ const COMMAND_STRING_RUNNERS: &[&str] = &[
     "hyperfine",
     "herdr",
     "tmux",
+    "slb",
 ];
 
 /// The option that hands each flag runner its command string.
