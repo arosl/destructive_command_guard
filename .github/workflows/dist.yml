@@ -34,7 +34,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: nightly-2026-08-25
+          toolchain: nightly-2026-08-31
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -107,7 +107,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust nightly
-        # rust-toolchain.toml pins channel = "nightly-2026-08-25", so every
+        # rust-toolchain.toml pins channel = "nightly-2026-08-31", so every
         # `cargo build --target ...` below is forced onto THAT nightly. The
         # previous `@nightly` (floating latest) installed the cross-target
         # std (`rustup target add`) against the *latest* nightly instead, so
@@ -123,7 +123,7 @@ jobs:
         # with rust-toolchain.toml.
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: nightly-2026-08-25
+          toolchain: nightly-2026-08-31
           targets: ${{ matrix.target }}
 
       - name: Install apt build deps (Linux)
