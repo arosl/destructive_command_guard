@@ -6,14 +6,14 @@ The fork follows upstream closely. It carries only the changes below, merges ups
 
 ## Changes from upstream
 
-On `main`, after upstream's `main` (last merged at `786b5aed`, 2026-10-23):
+On `main`, after upstream's `main` (last merged at `a6f82fe6`, 2026-10-23):
 
 | Commit | Change | Why |
 |---|---|---|
 | `018a4519` | `herdr pane run`, `herdr pane send-text`, tmux's shell-command subcommands and the keys of `tmux send-keys` are command-string runners. `herdr agent prompt`, which sends text to an agent, stays data. | These hand their string to a shell, so a destructive command passed as one quoted word was allowed, while its unquoted and `bash -c` forms were denied. |
 | `4c00c5b1` | `slb run`, `slb request --wait --execute` and `slb emergency-execute` are command-string runners. A new always-on `core.slb` pack denies `slb execute <id>` and `emergency-execute --yes --ack`. | These run the command in the caller's shell. `slb execute` runs a stored request that dcg never sees, and the `--ack` path needs no human. |
 | `1e147c7a` | `install.sh`, `install.ps1`, `dcg update` (`src/update.rs`, `src/cli.rs`) and `Cargo.toml` point at `arosl`, and the version is 0.15.4. | The fork's installer and `dcg update` must fetch the fork's releases and check their cosign identity. Otherwise `dcg update` replaces the fork's binary with upstream's. |
-| `6ffe22d1` | `dist.yml` installs `nightly-2026-08-31`, the toolchain that `rust-toolchain.toml` pins. | With the older nightly, the musl and aarch64-windows builds failed (E0463), and the release job was skipped. Upstream's `main` still installs `nightly-2026-08-25` (at `786b5aed`); drop this once it installs the pinned nightly. |
+| `6ffe22d1` | `dist.yml` installs `nightly-2026-08-31`, the toolchain that `rust-toolchain.toml` pins. | With the older nightly, the musl and aarch64-windows builds failed (E0463), and the release job was skipped. Upstream's `main` still installs `nightly-2026-08-25` (at `a6f82fe6`); drop this once it installs the pinned nightly. |
 | `2e854df0` | `.beads/` is no longer tracked, except its `.gitignore`, which ignores everything. The files stay on disk, and the fork's own work is tracked in this checkout's br. It is not part of a release. | ACFS's agents take reports on dcg in this repo (the operator, 2026-10-14), and br writes the local user name and checkout path into every bead, while this fork is public. |
 
 Disabled in this repository's Actions settings: `release-automation` (it tags `v<Cargo version>` on every push to `main`), and `Notify ACFS checksum monitor` and `Notify ACFS of Installer Change` (they dispatch to upstream ACFS).
