@@ -440,9 +440,20 @@ impl ContextClassifier {
                             i += 2;
                             continue;
                         }
+                        // `${…}` is part of the word it is in, blanks, `;`
+                        // and `#` included: pass over it whole, so a `#`
+                        // after a blank inside it starts no comment.
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                            i = consume_braced_parameter(command, i, true).0;
+                            continue;
+                        }
+                        // A carriage return or form feed is no blank to the
+                        // shell: a `#` right after one is part of a word.
                         b'#' if i == 0
-                            || bytes[i - 1].is_ascii_whitespace()
-                            || matches!(bytes[i - 1], b'|' | b'&' | b';') =>
+                            || matches!(
+                                bytes[i - 1],
+                                b' ' | b'\t' | b'\n' | b'|' | b'&' | b';'
+                            ) =>
                         {
                             // Comment start if start of word (including after separators).
                             if i > span_start {
@@ -574,7 +585,11 @@ impl ContextClassifier {
                         b'"' => stack.push(TokenizerState::DoubleQuote),
                         b'\'' => stack.push(TokenizerState::SingleQuote),
                         b'`' => stack.push(TokenizerState::Backtick),
-                        b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() => {
+                        b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                            i = consume_braced_parameter(command, i, true).0;
+                            continue;
+                        }
+                        b'#' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n') => {
                             stack.push(TokenizerState::Comment);
                         }
                         _ => {}
@@ -1017,8 +1032,13 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         // kubectl - annotations and labels are metadata
         SafeFlagEntry::long("kubectl", "--annotation"),
         SafeFlagEntry::both("kubectl", "-l", "--label"),
-        // xargs - placeholder string is literal
-        SafeFlagEntry::short("xargs", "-I"),
+        // No `xargs -I`: its placeholder is not data to hide but the argv
+        // word that ends xargs' options. Blanking it (`xargs -I{} unlink {}`
+        // became `xargs -I   unlink {}`) made every option parser on the
+        // sanitized view read the CHILD COMMAND as the placeholder, so an
+        // executed `unlink`, `chmod`, ... never reached its rule and was
+        // allowed.
+        // The placeholder reappears unmasked in the child argv anyway.
         // Cargo/npm - package descriptions
         SafeFlagEntry::long("cargo", "--message"),
         SafeFlagEntry::long("npm", "--message"),
@@ -1036,7 +1056,7 @@ static SAFE_COMMANDS_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
         // all_args_data commands
         "echo", "printf", // Commands from flag_data_pairs
         "git", "bd", "br", "grep", "rg", "ag", "ack", "sed", "gh", "curl", "jq", "docker",
-        "kubectl", "xargs", "cargo", "npm",
+        "kubectl", "cargo", "npm",
         // Special built-in: `command -v/-V` queries mask their arguments
         "command",
     ];
@@ -1135,23 +1155,47 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
 
 /// Decode one static POSIX word for the scoped flowctl data contract.
 fn flowctl_static_word(raw: &str) -> Option<String> {
-    use crate::normalize::{ShellDialect, ShellTokenDecoder, ShellTokenRole};
-    // Reject shell expansion and control metacharacters. Numeric byte values
-    // keep this boundary explicit and independent of quote-removal behavior.
-    if raw.is_empty()
-        || raw.bytes().any(|byte| {
-            matches!(
-                byte,
-                36 | 96 | 42 | 63 | 91 | 123 | 126 | 59 | 124 | 38 | 40 | 41 | 60 | 62
-            )
-        })
-    {
+    if raw.is_empty() {
         return None;
     }
-    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
-    decoder
-        .decode(raw, ShellTokenRole::Syntax)
-        .map(Cow::into_owned)
+    // Validate the raw word before quote removal. Separators, globs, and
+    // expansion spellings are data inside single quotes; double quotes keep
+    // separators literal but still execute dollar/backtick substitutions.
+    // Applying a byte blacklist after losing these roles rejected receipt
+    // text such as 'npm test; git reset --hard' (#540).
+    let bytes = raw.as_bytes();
+    let mut quote = None;
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match (quote, byte) {
+            (Some(b'\''), b'\'') | (Some(b'"'), b'"') => quote = None,
+            (Some(b'\''), _) => {}
+            (_, b'\\') => {
+                let &escaped = bytes.get(index + 1)?;
+                if quote.is_none() || matches!(escaped, b'$' | b'`' | b'"' | b'\\' | b'\n') {
+                    index += 1;
+                }
+            }
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (_, b'$' | b'`') => return None,
+            (
+                None,
+                b'*' | b'?' | b'[' | b'{' | b'~' | b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>'
+                | b'#',
+            ) => {
+                return None;
+            }
+            (None, byte) if byte.is_ascii_whitespace() => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let mut words = shell_words::split(raw).ok()?.into_iter();
+    let value = words.next()?;
+    words.next().is_none().then_some(value)
 }
 
 /// Return static data operand indices for flowctl gate check/receipt (#538).
@@ -2556,8 +2600,10 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
             continue;
         }
 
-        // Check for comment start
-        if i < len && bytes[i] == b'#' {
+        // Check for comment start. A carriage return or form feed is skipped
+        // above like a blank, but the shell does not read either as one: a
+        // `#` right after it is part of a word.
+        if i < len && bytes[i] == b'#' && (i == 0 || !matches!(bytes[i - 1], b'\r' | b'\x0c')) {
             // Consume until newline
             let start = i;
             while i < len && bytes[i] != b'\n' {
@@ -2709,6 +2755,13 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
             b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
                 has_inline_code = true;
                 i = consume_dollar_paren(command, i);
+            }
+            // `${x:- #}` is one word: a blank inside the braces does not end
+            // it, so the `#` after one starts no comment.
+            b'$' if i + 1 < len && bytes[i + 1] == b'{' => {
+                let (end, inline) = consume_braced_parameter(command, i, true);
+                has_inline_code |= inline;
+                i = end;
             }
             b'<' | b'>' if i + 1 < len && bytes[i + 1] == b'(' => {
                 has_inline_code = true;
@@ -2894,6 +2947,97 @@ fn consume_backticks(command: &str, start: usize) -> usize {
         }
     }
     i
+}
+
+/// End of the `${…}` parameter expansion whose `$` is at `start`, and whether
+/// it holds a command substitution. The shell reads the expansion as part of
+/// one word, blanks, `;` and `#` included, up to the `}` that closes it. As
+/// in the shell, only a `${` nests (a plain `{` is an ordinary character),
+/// and quotes, escapes and substitutions inside it are passed over whole, so
+/// a `}` in them closes nothing.
+///
+/// With `line_bounded`, the word is cut at the end of its line when no `}`
+/// closes it there. The shell would read on, but a line that does not close
+/// the expansion is rarely shell syntax at all (a heredoc's body line, say),
+/// and a reader that masks a word could take the commands of the lines after
+/// it for part of this one.
+#[must_use]
+pub(crate) fn consume_braced_parameter(
+    command: &str,
+    start: usize,
+    line_bounded: bool,
+) -> (usize, bool) {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+
+    debug_assert_eq!(bytes.get(start..start + 2), Some(&b"${"[..]));
+
+    let mut i = start + 2;
+    let mut depth = 1usize;
+    let mut has_inline_code = false;
+    while i < len {
+        match bytes[i] {
+            b'\n' if line_bounded => return (i, has_inline_code),
+            b'\\' => i = (i + 2).min(len),
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                depth += 1;
+                i += 2;
+            }
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(i + 1) == Some(&b'\'') => {
+                i += 2;
+                while i < len && bytes[i] != b'\'' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(len);
+            }
+            b'}' => {
+                i += 1;
+                depth -= 1;
+                if depth == 0 {
+                    return (i, has_inline_code);
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < len && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                i = (i + 1).min(len);
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    match bytes[i] {
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\\' => i = (i + 2).min(len),
+                        b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                            has_inline_code = true;
+                            i = consume_dollar_paren(command, i);
+                        }
+                        b'`' => {
+                            has_inline_code = true;
+                            i = consume_backticks(command, i);
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'(') => {
+                has_inline_code = true;
+                i = consume_dollar_paren(command, i);
+            }
+            b'`' => {
+                has_inline_code = true;
+                i = consume_backticks(command, i);
+            }
+            _ => i += 1,
+        }
+    }
+    (len, has_inline_code)
 }
 
 #[inline]
@@ -3870,6 +4014,54 @@ mod tests {
         assert!(code_span.is_some(), "python -c content must be InlineCode");
     }
 
+    /// A `#` that does not start a word starts no comment: inside `${…}`
+    /// (whose blanks do not end the word) or right after a carriage return or
+    /// form feed (no blank to the shell). The rest of the line stays visible
+    /// to both readers; a `#` that does start a word still hides its line.
+    #[test]
+    fn hash_inside_a_word_starts_no_comment() {
+        for cmd in [
+            "echo ${x:- #}; rm -rf /",
+            "echo ${x:-${y} #}; rm -rf /",
+            "echo ${x:-\"}\" #}; rm -rf /",
+            "echo ${x:-$(echo }) #}; rm -rf /",
+            "echo ${x:-$'a\\'b' #}; rm -rf /",
+            "echo a\r#b; rm -rf /",
+            "echo a\x0c#b; rm -rf /",
+        ] {
+            assert!(
+                sanitize_for_pattern_matching(cmd).contains("rm -rf /"),
+                "{cmd:?}"
+            );
+            let spans = classify_command(cmd);
+            assert!(
+                spans
+                    .spans()
+                    .iter()
+                    .all(|span| span.kind != SpanKind::Comment),
+                "{cmd:?}: {spans:?}"
+            );
+        }
+        for cmd in [
+            "echo ${x} # rm -rf /",
+            "echo ${x:-{} # rm -rf /",
+            "echo a\r\n# rm -rf /",
+        ] {
+            assert!(
+                !sanitize_for_pattern_matching(cmd).contains("rm -rf /"),
+                "{cmd:?}"
+            );
+            let spans = classify_command(cmd);
+            assert!(
+                spans
+                    .spans()
+                    .iter()
+                    .any(|span| span.kind == SpanKind::Comment && span.text(cmd) == "# rm -rf /"),
+                "{cmd:?}: {spans:?}"
+            );
+        }
+    }
+
     #[test]
     fn sanitize_masks_powershell_block_comment() {
         // A destructive string inside `<# ... #>` must be masked so it can't match
@@ -3900,6 +4092,92 @@ mod tests {
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("bd create"));
         assert!(sanitized.as_ref().contains("--description="));
+    }
+
+    #[test]
+    fn flowctl_static_words_preserve_quoted_and_escaped_data_540() {
+        for (raw, expected) in [
+            ("'npm test; git reset --hard'", "npm test; git reset --hard"),
+            (
+                "\"printf '(literal)' > result\"",
+                "printf '(literal)' > result",
+            ),
+            ("'grep $HOME *.rs | cat'", "grep $HOME *.rs | cat"),
+            ("'literal `git reset --hard`'", "literal `git reset --hard`"),
+            (
+                r"npm\ test\;\ git\ reset\ --hard",
+                "npm test; git reset --hard",
+            ),
+            (r#""\$(git reset --hard)""#, "$(git reset --hard)"),
+            ("'multiline\ndata; Ω'", "multiline\ndata; Ω"),
+            ("'npm 'test", "npm test"),
+            ("''", ""),
+        ] {
+            assert_eq!(
+                flowctl_static_word(raw).as_deref(),
+                Some(expected),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flowctl_static_words_reject_live_or_incomplete_syntax_540() {
+        for raw in [
+            "",
+            "$ARGS",
+            "\"$ARGS\"",
+            "$(git reset --hard)",
+            "\"$(git reset --hard)\"",
+            "`git reset --hard`",
+            r#""\\$(git reset --hard)""#,
+            "*.sh",
+            "a?b",
+            "[ab]",
+            "{a,b}",
+            "~/script",
+            "a;b",
+            "a|b",
+            "a&b",
+            "(a)",
+            "a>b",
+            "a<b",
+            "#comment",
+            "two words",
+            "'unterminated",
+            "\"unterminated",
+            "trailing\\",
+        ] {
+            assert!(flowctl_static_word(raw).is_none(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_flowctl_data_preserves_executable_boundaries_540() {
+        for source in [
+            r#""$FLOWCTL" gate check --command 'npm test; git reset --hard'"#,
+            r#"flowctl gate receipt --command="echo (git reset --hard)""#,
+            r#"flowctl gate check --command 'grep "$HOME" *.rs; git reset --hard'"#,
+            r"flowctl gate check --command npm\ test\;\ git\ reset\ --hard",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(source);
+            assert_eq!(sanitized.len(), source.len(), "{source:?}");
+            assert!(!sanitized.contains("git"), "{source:?}: {sanitized}");
+            assert!(sanitized.contains("gate"), "{source:?}: {sanitized}");
+        }
+        for source in [
+            r#""$FLOWCTL" gate check --command "$(git reset --hard)""#,
+            r#""$FLOWCTL" gate check --command 'npm test'; git reset --hard"#,
+            r#""$FLOWCTL" gate check --command 'npm test' > /etc/profile"#,
+            r#""$FLOWCTL" gate run --command 'git reset --hard'"#,
+            r#""$FLOWCTL" gate check --unknown --command 'git reset --hard'"#,
+        ] {
+            let sanitized = sanitize_for_pattern_matching(source);
+            assert!(
+                sanitized.contains("git reset --hard") || sanitized.contains("> /etc/profile"),
+                "live or unsupported syntax was hidden: {source:?}: {sanitized}"
+            );
+        }
     }
 
     #[test]
@@ -4497,8 +4775,22 @@ mod tests {
 
     #[test]
     fn test_registry_xargs_placeholder_flag() {
-        // xargs -I sets a placeholder string
-        assert!(SAFE_STRING_REGISTRY.is_flag_data("xargs", "-I"));
+        // The `-I` placeholder is the word that ends xargs' options. Masking
+        // it left `xargs -I   unlink {}`, where every option parser reads the
+        // child command as the placeholder and the executed `unlink` vanished.
+        assert!(!SAFE_STRING_REGISTRY.is_flag_data("xargs", "-I"));
+        for command in [
+            "xargs -I{} unlink {}",
+            "xargs -I {} unlink {}",
+            "cat list | xargs -I{} mv {} /tmp/x",
+            "xargs -I% unlink %",
+        ] {
+            assert_eq!(
+                sanitize_for_pattern_matching(command),
+                command,
+                "the xargs placeholder must stay in the sanitized argv: {command:?}"
+            );
+        }
         // Counterexample: xargs itself can execute commands
         assert!(!SAFE_STRING_REGISTRY.is_all_args_data("xargs"));
     }

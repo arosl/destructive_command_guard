@@ -59,9 +59,8 @@ use crate::packs::{
     pack_aware_quick_reject_with_normalized,
 };
 use crate::pending_exceptions::AllowOnceStore;
-use crate::perf::Deadline;
-use ast_grep_core::{AstGrep, Doc};
-use ast_grep_language::SupportLang;
+use crate::perf::{Deadline, ProfilePhase, phase};
+use ast_grep_core::Doc;
 use chrono::Utc;
 use regex::RegexSet;
 use std::borrow::Cow;
@@ -500,6 +499,11 @@ pub struct EvaluationResult {
     pub effective_mode: Option<crate::packs::DecisionMode>,
     /// Whether evaluation skipped deeper analysis due to a deadline overrun.
     pub skipped_due_to_budget: bool,
+    /// A regex, or an optional embedded-source proof such as interpreter
+    /// literal recovery, failed during this request. Positive evidence may
+    /// still deny, but a policy/confidence downgrade cannot authorize
+    /// incomplete work.
+    pub regex_evaluation_incomplete: bool,
     /// Whether the evaluator proved that no enabled-pack keyword was present
     /// and returned through the bounded quick-reject fast path.
     pub quick_rejected: bool,
@@ -526,6 +530,7 @@ impl EvaluationResult {
             effective_mode: None,
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -555,6 +560,7 @@ impl EvaluationResult {
             effective_mode: None,
             skipped_due_to_budget: false,
             quick_rejected: true,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -565,7 +571,11 @@ impl EvaluationResult {
     /// Create an indeterminate result due to analysis-budget exhaustion.
     #[inline]
     #[must_use]
-    pub const fn indeterminate_due_to_budget() -> Self {
+    pub fn indeterminate_due_to_budget() -> Self {
+        // Name the phase that ran out for the hook's reason (#571), including
+        // the case where the remaining budget is too small for the next step
+        // although the deadline itself has not passed.
+        crate::perf::note_deadline_exhausted();
         Self {
             decision: EvaluationDecision::Indeterminate,
             pattern_info: None,
@@ -573,6 +583,7 @@ impl EvaluationResult {
             effective_mode: None,
             skipped_due_to_budget: true,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -601,6 +612,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -629,6 +641,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -668,6 +681,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -727,6 +741,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -793,6 +808,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Warn),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -822,6 +838,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -850,6 +867,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -885,6 +903,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -920,6 +939,7 @@ impl EvaluationResult {
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -958,6 +978,7 @@ impl EvaluationResult {
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -984,6 +1005,7 @@ impl EvaluationResult {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1587,6 +1609,19 @@ pub fn evaluate_command(
 #[inline]
 fn deadline_exceeded(deadline: Option<&Deadline>) -> bool {
     deadline.is_some_and(Deadline::is_exceeded)
+}
+
+/// The text keyword gating reads: the command without its inert POSIX
+/// redirections ([`crate::packs::blank_inert_redirections`], #571). Cmd and
+/// PowerShell give `>` and `/dev/null` other meanings (`2>/dev/null` writes a
+/// file there), so those dialects keep the full text.
+#[inline]
+fn inert_redirection_gating_view(command: &str, shell_dialect: ShellDialect) -> Cow<'_, str> {
+    if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        crate::packs::blank_inert_redirections(command)
+    } else {
+        Cow::Borrowed(command)
+    }
 }
 
 #[inline]
@@ -4620,7 +4655,16 @@ fn parse_powershell_launcher(
 }
 
 fn cmd_host_switch(raw: &str, outer_dialect: ShellDialect) -> Option<String> {
-    shell_word_value(raw, outer_dialect).map(|word| word.to_ascii_lowercase())
+    let mut option = shell_word_value(raw, outer_dialect)?.to_ascii_lowercase();
+    // MSYS2/Git Bash rewrites a leading /x argument as a path. Its documented
+    // escape hatch is //x, which reaches cmd.exe as /x. Normalize that spelling
+    // only when the *outer* shell is POSIX; native Cmd and PowerShell retain
+    // their own argv semantics. Unknown doubled switches stay unknown after
+    // normalization and therefore continue to fail closed below.
+    if outer_dialect == ShellDialect::Posix && option.starts_with("//") {
+        option.remove(0);
+    }
+    Some(option)
 }
 
 fn cmd_switch_is_non_executing(option: &str) -> bool {
@@ -5989,6 +6033,127 @@ fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usiz
     })
 }
 
+/// The first source operand Python actually takes from `-c`. Interface
+/// options terminate interpreter option parsing; later `-c` words belong to
+/// the script or module. Unknown option syntax cannot establish ownership.
+fn python_inline_source_word<'a>(words: &[&'a str]) -> Option<&'a str> {
+    const NO_VALUE_OPTIONS: &[u8] = b"bBdEiIOPqRsStuvx";
+    if words.len() > MAX_STATIC_SHELL_SOURCE_TERMS {
+        return None;
+    }
+    let static_option = |raw: &str| {
+        if posix_eval_word_has_dynamic_source(raw) || contains_dynamic_posix_substitution(raw) {
+            None
+        } else {
+            literal_posix_executable_value(raw)
+        }
+    };
+    let mut index = 1usize;
+    'options: while let Some(raw) = words.get(index).copied() {
+        // A plain short-option prefix retains the exact quoting of an
+        // attached source (`-Ic"$SCRIPT"`), even though that whole argv word
+        // cannot be statically decoded. Stop before value-taking options.
+        if let Some(letters) = raw.strip_prefix('-') {
+            for (offset, byte) in letters.bytes().enumerate() {
+                if byte == b'c' {
+                    let source = letters.get(offset + 1..)?;
+                    return if source.is_empty() {
+                        words.get(index + 1).copied()
+                    } else {
+                        Some(source)
+                    };
+                }
+                if !NO_VALUE_OPTIONS.contains(&byte) {
+                    break;
+                }
+            }
+        }
+
+        let option = static_option(raw)?;
+        if option == "--check-hash-based-pycs" {
+            let value = static_option(words.get(index + 1)?)?;
+            if !matches!(value.as_str(), "default" | "always" | "never") {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        let letters = option.strip_prefix('-')?;
+        if letters.is_empty() || letters.starts_with('-') {
+            return None;
+        }
+        for (offset, byte) in letters.bytes().enumerate() {
+            match byte {
+                b'c' => {
+                    // A complete, quoted option word can spell -c too. An
+                    // attached literal source is already static; do not lose
+                    // its raw quoting by treating decoded dollars as live.
+                    return (offset + 1 == letters.len())
+                        .then(|| words.get(index + 1).copied())
+                        .flatten();
+                }
+                b'W' | b'X' => {
+                    if offset + 1 == letters.len() {
+                        static_option(words.get(index + 1)?)?;
+                        index += 1;
+                    }
+                    index += 1;
+                    continue 'options;
+                }
+                byte if NO_VALUE_OPTIONS.contains(&byte) => {}
+                // Includes -m, help/version options and unsupported flags.
+                _ => return None,
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// A whole live shell expansion supplied as Python source, with the original
+/// word's quotes intact. Literal dollars and partly dynamic programs retain
+/// their existing language-aware analysis. Arithmetic yields a numeric value,
+/// not arbitrary program source, and is outside this narrow guard.
+fn posix_word_is_wholly_dynamic_python_source(raw: &str) -> bool {
+    if literal_posix_executable_value(raw).is_some() {
+        return false;
+    }
+    let expansion = raw
+        .strip_prefix('"')
+        .and_then(|word| word.strip_suffix('"'))
+        .unwrap_or(raw);
+    !expansion.starts_with("$((")
+        && expansion.starts_with(['$', '`'])
+        && inline_shell_script_is_wholly_dynamic(expansion)
+}
+
+fn python_inline_source_is_wholly_dynamic(
+    words: &[&str],
+    original_words: &[&str],
+    has_dynamic_substitution: bool,
+) -> bool {
+    let Some(source) = python_inline_source_word(words) else {
+        return false;
+    };
+    if posix_word_is_wholly_dynamic_python_source(source) {
+        return true;
+    }
+    // The shared substitution view resolves supported literal producers and
+    // marks unknown output. Consult the original operand only for a whole
+    // marker, so resolved producers and partially dynamic source stay on
+    // their existing path, and arithmetic is not mistaken for a command.
+    has_dynamic_substitution
+        && literal_posix_executable_value(source).is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                crate::packs::core::git::POSIX_DYNAMIC_QUOTED
+                    | crate::packs::core::git::POSIX_DYNAMIC_UNQUOTED
+            )
+        })
+        && python_inline_source_word(original_words)
+            .is_some_and(posix_word_is_wholly_dynamic_python_source)
+}
+
 fn parse_obfuscated_posix_inline_launcher_segment(
     segment: &str,
     max_payload_bytes: usize,
@@ -6082,6 +6247,24 @@ fn parse_obfuscated_posix_inline_launcher_segment(
 
     let name = decoded_name.expect("dynamic executable returned above");
     let recognized = posix_inline_shell_name(&name) || non_shell_inline_interpreter_name(&name);
+    if recognized && name.starts_with("python") {
+        let original_exec_index = original_words
+            .iter()
+            .position(|word| !posix_word_is_assignment_prefix(word))
+            .unwrap_or(0);
+        if python_inline_source_is_wholly_dynamic(
+            words,
+            &original_words[original_exec_index..],
+            substitution_view
+                .as_ref()
+                .is_some_and(|view| view.has_dynamic),
+        ) {
+            return PosixInlineLauncherParse::Unverified(
+                "Python inline source is a whole shell expansion or unresolved command substitution"
+                    .to_string(),
+            );
+        }
+    }
     if !recognized
         || (posix_executable_word_is_plain(raw_executable) && !executable_was_statically_resolved)
     {
@@ -7836,7 +8019,9 @@ fn is_posix_stdin_code_path(argument: &str) -> bool {
     )
 }
 
-fn static_posix_shell_code_reads_stdin(source: &str) -> bool {
+/// Whether static `-c` shell code runs the shell's own stdin as code. Also
+/// asked by the awk extractor about a `print … | "sh -c '…'"` target (#511).
+pub(crate) fn static_posix_shell_code_reads_stdin(source: &str) -> bool {
     let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
     let words: Vec<String> = tokens
         .iter()
@@ -8698,7 +8883,7 @@ fn cmd_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
 /// to the caller's shell, and quoted redirect-looking arguments remain words.
 /// A compound or dynamic command has no single verified argv boundary.
 fn static_posix_command_without_redirects(command: &str) -> Option<String> {
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -9836,7 +10021,7 @@ fn process_substitution_writer_source(
         marker,
         &command[substitution_end..]
     );
-    let ast = AstGrep::new(&reconstructed, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(&reconstructed);
     if ast_contains_error(ast.root()) {
         return Some(IndirectInputSource::Unverified(
             "process-substitution writer cannot be parsed for bounded analysis".to_string(),
@@ -9929,7 +10114,7 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
     if !command.contains("<(") && !command.contains(">(") {
         return;
     }
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         sinks.push(ExecutableTextSink::Unverified {
             rule: PROCESS_SUBSTITUTION_RULE,
@@ -10077,7 +10262,7 @@ fn collect_posix_pipeline_executable_sinks(
         });
         return;
     }
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast.root().get_inner_node().has_error() {
         return;
     }
@@ -11398,6 +11583,132 @@ fn cmd_unescaped_redirect_suffix(word: &str) -> Option<(usize, bool)> {
     None
 }
 
+/// The Cmd or PowerShell counterpart of
+/// [`crate::heredoc::redirection_free_view`]: every redirection the shell
+/// performs, glued to a word (`prog>nul`, `2>$null`) or standing alone with
+/// the target that follows it (`> nul`), blank-filled at unchanged byte
+/// offsets. `None` for other dialects, and when there is no redirection.
+///
+/// A descriptor number or PowerShell's `*` written before the operator
+/// belongs to it. PowerShell's tokenizer splits a stream merge (`2>&1`) at
+/// its `&`, so that `&` and the descriptor after it are part of the
+/// redirection too. PowerShell text that is not command syntax stays as
+/// written, so the view never turns it into syntax: a comment (`# …` to the
+/// end of its line, `<# … #>`), a word spanning lines (a here-string), and
+/// the words after the stop-parsing token `--%`, which reach the program
+/// verbatim. Only the redirections the shell performs are blanked: a word
+/// led by `<` stays as written in PowerShell, which has no input
+/// redirection, and a `<<` word in both, since neither shell has that
+/// operator and the full reading takes it for the POSIX heredoc or
+/// here-string it spells, whose body is data to a reader like `cat`.
+fn windows_redirection_free_view(command: &str, dialect: ShellDialect) -> Option<String> {
+    let redirect_suffix: fn(&str) -> Option<(usize, bool)> = match dialect {
+        ShellDialect::Cmd => cmd_unescaped_redirect_suffix,
+        ShellDialect::PowerShell => powershell_unescaped_redirect_suffix,
+        ShellDialect::Posix | ShellDialect::Unknown => return None,
+    };
+    memchr::memchr2(b'<', b'>', command.as_bytes())?;
+    let powershell = dialect == ShellDialect::PowerShell;
+    let mut view: Option<Vec<u8>> = None;
+    let mut blank = |range: Range<usize>| {
+        let bytes = view.get_or_insert_with(|| command.as_bytes().to_vec());
+        for byte in &mut bytes[range] {
+            if !matches!(*byte, b'\r' | b'\n') {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut target_next = false;
+    let mut previous_word_end = None;
+    // PowerShell: the end of the comment being passed over, and whether the
+    // words are verbatim arguments after `--%` (until a pipe or newline).
+    let mut comment_end = 0usize;
+    let mut verbatim = false;
+    for token in &tokenize_for_shell_dialect(command, dialect) {
+        if token.byte_range.start < comment_end {
+            continue;
+        }
+        if token.kind != NormalizeTokenKind::Word {
+            let stream_merge = powershell
+                && target_next
+                && token.text(command) == Some("&")
+                && previous_word_end == Some(token.byte_range.start);
+            if stream_merge {
+                blank(token.byte_range.clone());
+            } else {
+                target_next = false;
+            }
+            previous_word_end = None;
+            verbatim = false;
+            continue;
+        }
+        previous_word_end = Some(token.byte_range.end);
+        let Some(raw) = token.text(command) else {
+            continue;
+        };
+        if powershell {
+            if verbatim || raw.contains(['\r', '\n']) {
+                target_next = false;
+                continue;
+            }
+            let rest = &command[token.byte_range.start..];
+            if raw.starts_with("<#") {
+                comment_end = rest
+                    .get(2..)
+                    .and_then(|body| body.find("#>"))
+                    .map_or(command.len(), |at| token.byte_range.start + 2 + at + 2);
+                target_next = false;
+                continue;
+            }
+            if raw.starts_with('#') {
+                comment_end = token.byte_range.start
+                    + memchr::memchr2(b'\r', b'\n', rest.as_bytes()).unwrap_or(rest.len());
+                target_next = false;
+                continue;
+            }
+            // The decoder consumes `--%` (quoted or not) as control syntax.
+            if ShellTokenDecoder::new(ShellDialect::PowerShell)
+                .decode(raw, ShellTokenRole::Syntax)
+                .is_none()
+            {
+                verbatim = true;
+                target_next = false;
+                continue;
+            }
+        }
+        if std::mem::take(&mut target_next) {
+            blank(token.byte_range.clone());
+            continue;
+        }
+        let Some((start, needs_target)) = redirect_suffix(raw) else {
+            continue;
+        };
+        // Only what the shell itself redirects is blanked. PowerShell has no
+        // input redirection (`<` is a reserved operator there), and neither
+        // shell has `<<`: written in either, it is the POSIX heredoc or
+        // here-string that the full reading treats as one, so a reader's
+        // heredoc body is data there, and blanking the operator would leave
+        // that body behind as command text.
+        if raw.get(start..).is_some_and(|redirect| {
+            let operator = redirect.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '*');
+            operator.starts_with("<<") || (powershell && operator.starts_with('<'))
+        }) {
+            continue;
+        }
+        let start = if raw
+            .get(..start)
+            .is_some_and(|prefix| prefix.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            0
+        } else {
+            start
+        };
+        blank(token.byte_range.start + start..token.byte_range.end);
+        target_next = needs_target;
+    }
+    view.and_then(|view| String::from_utf8(view).ok())
+}
+
 fn cmd_leading_redirect_needs_target(word: &str) -> Option<bool> {
     let bytes = word.as_bytes();
     let mut index = bytes
@@ -12075,20 +12386,27 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
         // source" — `cat <<'EOF' | bash` executes the body, so they must see it,
         // and masking them turned that into an allow (#440, first attempt). The
         // eval collector asks "is there an eval here whose source I cannot
-        // resolve", and an eval sitting INSIDE a body that nothing executes is
-        // not one: `cat > script.rb <<'OUTER' … eval <<~'SCRIPT' … OUTER` writes a
-        // Ruby file, and Ruby's `eval` is not POSIX `eval`. Masking blanks exactly
-        // those bodies — quoted delimiter, target proven not to execute stdin —
-        // so the eval disappears with the text it was never part of.
+        // resolve". A quoted data body or a proven non-shell interpreter body
+        // cannot contain an outer shell eval: writing a Ruby file or running
+        // JavaScript's `eval` does not invoke POSIX `eval`. The two existing
+        // ownership masks remove only those bodies from this syntax view;
+        // interpreter source still reaches its language and raw-pattern scans.
         //
         // An eval that is real stays visible either way: outside any heredoc it is
         // untouched, and inside a body a pipeline hands to a shell the pipeline
         // collector recursively evaluates that body, where the eval is seen again.
-        let eval_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+        let data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
+        let eval_view = crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref());
         collect_posix_eval_sinks(eval_view.as_ref(), &mut sinks);
         let mut interpreter_heredocs = Vec::new();
         collect_posix_pipeline_executable_sinks(command, &mut sinks, &mut interpreter_heredocs);
-        collect_posix_process_substitution_sinks(command, &mut sinks);
+        // Process-substitution syntax inside a proven quoted non-shell
+        // interpreter body belongs to that language, not to the outer shell
+        // (#560). Unlike data-heredoc masking, this does not hide `cat <<EOF |
+        // bash`: only direct interpreter-owned bodies are blanked, while shell
+        // heredocs and ambiguous receivers stay byte-for-byte visible.
+        let process_view = crate::heredoc::mask_inert_interpreter_stdin(command);
+        collect_posix_process_substitution_sinks(process_view.as_ref(), &mut sinks);
         collect_data_heredoc_output_sinks(command, &interpreter_heredocs, &mut sinks);
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
@@ -12814,20 +13132,46 @@ struct ResolvedPosixExecutableInvocation {
     argv0_range: std::ops::Range<usize>,
     replacement_len: usize,
     command: String,
+    split_inline_launcher: bool,
+}
+
+#[derive(Debug)]
+enum ModeledPosixExecutableInvocation {
+    Resolved(ResolvedPosixExecutableInvocation),
+    Unverified {
+        range: std::ops::Range<usize>,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Default)]
 struct PosixExecutableAssignmentModel {
     inert_ranges: Vec<std::ops::Range<usize>>,
-    invocations: Vec<ResolvedPosixExecutableInvocation>,
+    invocations: Vec<ModeledPosixExecutableInvocation>,
 }
 
-/// Parse one assignment-only POSIX segment whose value is entirely literal.
-///
-/// The returned value keeps its original shell spelling so quoted executable
-/// paths remain one word when substituted into the later invocation. Dynamic
-/// values deliberately refuse the proof.
-fn literal_posix_executable_assignment(segment: &str) -> Option<(String, String)> {
+const MAX_POSIX_EXECUTABLE_BINDINGS: usize = 64;
+const MAX_POSIX_EXECUTABLE_SEGMENTS: usize = 128;
+const MAX_POSIX_EXECUTABLE_FIELDS: usize = 128;
+const MAX_POSIX_EXECUTABLE_VALUE_BYTES: usize = 16 * 1024;
+const POSIX_EXECUTABLE_UNVERIFIED_RULE: &str = "heredoc.posix.executable-unverified";
+
+#[derive(Clone, Copy)]
+enum ModeledPosixIfs {
+    Default,
+    Empty,
+    Unverified,
+}
+
+#[derive(Debug)]
+enum ModeledPosixBinding {
+    Literal(String),
+    Unverified(&'static str),
+}
+
+/// Return the two parts of one assignment-only POSIX segment. The value is
+/// still shell source; callers must decode it before modeling an expansion.
+fn posix_executable_assignment_parts(segment: &str) -> Option<(&str, &str)> {
     let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
     let mut words = tokens
         .iter()
@@ -12845,35 +13189,49 @@ fn literal_posix_executable_assignment(segment: &str) -> Option<(String, String)
     let name = raw.get(..equals)?;
     let raw_value = raw.get(equals + 1..)?;
     if name.is_empty()
-        || raw_value.is_empty()
         || !name.bytes().enumerate().all(|(index, byte)| {
             byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
         })
-        || contains_dynamic_shell_output(raw_value)
     {
         return None;
     }
-    let decoded = shell_word_value(raw, ShellDialect::Posix)?;
-    let (decoded_name, decoded_value) = decoded.split_once('=')?;
-    if decoded_name != name || decoded_value.is_empty() {
+    Some((name, raw_value))
+}
+
+/// Decode assignment-time quotes exactly once. In particular, those quotes
+/// cannot protect whitespace when the later variable expansion is unquoted.
+fn literal_posix_executable_value(raw: &str) -> Option<String> {
+    // Assignment words suppress field splitting and pathname expansion, so
+    // unquoted `X=g*` binds the same literal pattern as `X='g*'`. The shared
+    // syntax decoder returns an owned value only when every quote and escape
+    // was decoded without encountering a runtime expansion. Locale-quoted
+    // text still depends on translation and cannot establish a literal value.
+    if raw.contains("$\"") {
         return None;
     }
-    Some((name.to_string(), raw_value.to_string()))
+    match crate::normalize::decode_posix_syntax_token(raw) {
+        Cow::Owned(value) => Some(value),
+        Cow::Borrowed(value) if !value.contains(['$', '`', '\'', '"', '\\', '~', '<', '>']) => {
+            Some(value.to_string())
+        }
+        Cow::Borrowed(_) => None,
+    }
 }
 
 /// Return an exact executable-position variable reference.
-fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>)> {
+fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>, bool)> {
     let token = tokenize_for_shell_dialect(segment, ShellDialect::Posix)
         .into_iter()
         .find(|token| token.kind == NormalizeTokenKind::Word)?;
     let raw = token.text(segment)?;
-    let expansion = if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        inner
-    } else if raw.starts_with('\'') {
-        return None;
-    } else {
-        raw
-    };
+    let (expansion, quoted) =
+        if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            (inner, true)
+        } else if raw.starts_with('\'') {
+            return None;
+        } else {
+            (raw, false)
+        };
     let name = expansion
         .strip_prefix('$')
         .and_then(|value| value.strip_prefix('{'))
@@ -12886,7 +13244,126 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
     {
         return None;
     }
-    Some((name.to_string(), token.byte_range))
+    Some((name.to_string(), token.byte_range, quoted))
+}
+
+/// Render the argv fields produced by one variable expansion. Quotes and
+/// operators in the value are data: parameter expansion never reparses them
+/// as shell source. Only an unquoted expansion performs IFS splitting and
+/// pathname expansion, and the latter has no static filesystem proof here.
+fn render_posix_executable_expansion(
+    value: &str,
+    quoted: bool,
+    ifs: ModeledPosixIfs,
+) -> Result<(String, bool), &'static str> {
+    if value.len() > MAX_POSIX_EXECUTABLE_VALUE_BYTES {
+        return Err("the executable variable exceeds the bounded literal-value limit");
+    }
+    let fields: Vec<&str> = if quoted {
+        vec![value]
+    } else {
+        if matches!(ifs, ModeledPosixIfs::Unverified) {
+            return Err("an unquoted executable variable uses a custom or dynamic IFS value");
+        }
+        if value.contains(['*', '?', '[']) {
+            return Err("an unquoted executable variable can expand pathname patterns");
+        }
+        if value.is_empty() {
+            Vec::new()
+        } else if matches!(ifs, ModeledPosixIfs::Empty) {
+            vec![value]
+        } else {
+            // POSIX's default IFS is exactly space, tab and LF. CR, vertical
+            // tab and Unicode whitespace remain literal argument bytes.
+            value
+                .split([' ', '\t', '\n'])
+                .filter(|field| !field.is_empty())
+                .take(MAX_POSIX_EXECUTABLE_FIELDS + 1)
+                .collect()
+        }
+    };
+    if fields.len() > MAX_POSIX_EXECUTABLE_FIELDS {
+        return Err("the executable variable expands into too many argument fields");
+    }
+    let rendered_fields: Vec<String> = fields
+        .iter()
+        .map(|field| posix_single_quote_argument(field))
+        .collect();
+    // A split value that introduces interpreter options remains a bounded
+    // launcher proof, not flowctl receipt data (#540). Evaluate its concrete
+    // command first so a known destructive payload keeps its owning rule.
+    let split_inline_launcher = !quoted
+        && fields.len() > 1
+        && fields.first().is_some_and(|executable| {
+            let name = executable.rsplit('/').next().unwrap_or(executable);
+            (posix_inline_shell_name(name) || non_shell_inline_interpreter_name(name))
+                && posix_inline_flag_position(
+                    Some(name),
+                    &rendered_fields
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                )
+                .is_some()
+        });
+    Ok((rendered_fields.join(" "), split_inline_launcher))
+}
+
+/// Apply the same parent-shell mutation boundary as variable/path proofs.
+/// A concrete external Git invocation leaves a scalar intact, while eval,
+/// read, declarations and printf -v can invalidate every retained binding.
+fn modeled_posix_invocation_may_mutate_bindings(command: &str) -> bool {
+    let first = hazard_first_word(command);
+    first.contains(['$', '`'])
+        || first.starts_with('-')
+        || matches!(first.as_ref(), "command" | "builtin" | "time")
+        || match first.as_ref() {
+            // The reconstruction quotes every literal field, so quoting the
+            // command name is not itself uncertainty here. Inspect its exact
+            // argv instead of borrowing the raw-source printf heuristic.
+            "printf" => static_posix_command_without_redirects(command)
+                .and_then(|source| command_tokens(&source))
+                .is_none_or(|(_, arguments)| {
+                    arguments
+                        .first()
+                        .is_some_and(|argument| argument.starts_with("-v"))
+                }),
+            other => matches!(
+                other,
+                "read"
+                    | "readonly"
+                    | "declare"
+                    | "typeset"
+                    | "local"
+                    | "export"
+                    | "let"
+                    | "eval"
+                    | "source"
+                    | "."
+                    | "mapfile"
+                    | "readarray"
+                    | "unset"
+                    | "getopts"
+                    | "select"
+                    | "trap"
+                    | "alias"
+            ),
+        }
+        // Arithmetic and parameter expansions can also assign in the parent
+        // shell even when the receiving command itself is an external tool.
+        || contains_dynamic_shell_output(command)
+}
+
+fn invalidate_modeled_posix_bindings(
+    bindings: &mut HashMap<String, ModeledPosixBinding>,
+    ifs: &mut ModeledPosixIfs,
+) {
+    for binding in bindings.values_mut() {
+        *binding = ModeledPosixBinding::Unverified(
+            "an earlier executable-variable invocation can change this shell binding",
+        );
+    }
+    *ifs = ModeledPosixIfs::Unverified;
 }
 
 /// Build the bounded literal-assignment portion of #289's command model.
@@ -12897,11 +13374,21 @@ fn posix_variable_argv0(segment: &str) -> Option<(String, std::ops::Range<usize>
 /// state. Each resolved invocation is evaluated independently, then its source
 /// bytes and the assignment-only segments are masked from the ordinary
 /// whole-command pass so another pack cannot misattribute their tokens.
+#[allow(clippy::too_many_lines)] // One bounded state machine keeps assignments, taint and source masks in order.
 fn model_literal_posix_executable_assignments(
     command: &str,
     dialect: ShellDialect,
 ) -> PosixExecutableAssignmentModel {
     if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return PosixExecutableAssignmentModel::default();
+    }
+    if !command.contains('$') || !command.contains('=') {
+        return PosixExecutableAssignmentModel::default();
+    }
+    if command.len() > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+        // Without a bounded parse there is no established executable use.
+        // Leave all source visible to the existing evaluation paths rather
+        // than converting a large data assignment into a launcher finding.
         return PosixExecutableAssignmentModel::default();
     }
     let ranges = top_level_segment_ranges(command);
@@ -12916,36 +13403,147 @@ fn model_literal_posix_executable_assignments(
         return PosixExecutableAssignmentModel::default();
     }
 
-    let mut bindings = HashMap::<String, String>::new();
+    // Tainted bindings remain known: forgetting one would let its later use
+    // silently fall back to an unresolved executable after eval changed it.
+    let mut bindings = HashMap::<String, ModeledPosixBinding>::new();
+    let mut binding_limit_exceeded = false;
+    let mut ifs = ModeledPosixIfs::Default;
+    let mut assignment_ranges = Vec::new();
+    let mut reconstructed_bytes = 0usize;
     let mut model = PosixExecutableAssignmentModel::default();
-    for &(start, end) in &ranges {
+    for (segment_index, &(start, end)) in ranges.iter().enumerate() {
         let Some(segment) = command.get(start..end) else {
-            return PosixExecutableAssignmentModel::default();
+            return model;
         };
-        if let Some((name, value)) = literal_posix_executable_assignment(segment) {
-            bindings.insert(name, value);
-            model.inert_ranges.push(start..end);
+        if segment_index >= MAX_POSIX_EXECUTABLE_SEGMENTS {
+            if posix_variable_argv0(segment).is_some() && !bindings.is_empty() {
+                model
+                    .invocations
+                    .push(ModeledPosixExecutableInvocation::Unverified {
+                        range: start..end,
+                        reason: "the executable-assignment model exceeds the bounded statement limit",
+                    });
+            }
+            // An inert tail past the limit must not erase an earlier proven
+            // destructive invocation, nor replace its rule with a waiver for
+            // the analysis limit.
+            return model;
+        }
+        if let Some((name, raw_value)) = posix_executable_assignment_parts(segment) {
+            let value = literal_posix_executable_value(raw_value);
+            if name == "IFS" {
+                ifs = match value.as_deref() {
+                    Some("") => ModeledPosixIfs::Empty,
+                    Some(" \t\n") => ModeledPosixIfs::Default,
+                    _ => ModeledPosixIfs::Unverified,
+                };
+            }
+            let Some(value) = value else {
+                if name == "IFS" {
+                    // `${X:=git}` and arithmetic assignment can update an
+                    // earlier binding while computing IFS. Quoting `$X`
+                    // later suppresses splitting, not that parent mutation.
+                    invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+                    continue;
+                }
+                break;
+            };
+            if !bindings.contains_key(name) && bindings.len() >= MAX_POSIX_EXECUTABLE_BINDINGS {
+                binding_limit_exceeded = true;
+                continue;
+            }
+            let binding = if value.len() > MAX_POSIX_EXECUTABLE_VALUE_BYTES {
+                ModeledPosixBinding::Unverified(
+                    "the executable variable exceeds the bounded literal-value limit",
+                )
+            } else if name != "IFS" && shell_maintained_posix_variable(name) {
+                ModeledPosixBinding::Unverified(
+                    "the executable variable is maintained by the shell rather than a stable scalar",
+                )
+            } else {
+                ModeledPosixBinding::Literal(value)
+            };
+            bindings.insert(name.to_string(), binding);
+            assignment_ranges.push(start..end);
             continue;
         }
-        let Some((name, argv0_range)) = posix_variable_argv0(segment) else {
+        let Some((name, argv0_range, quoted)) = posix_variable_argv0(segment) else {
             break;
         };
-        let Some(replacement) = bindings.get(&name) else {
+        if binding_limit_exceeded {
+            model
+                .invocations
+                .push(ModeledPosixExecutableInvocation::Unverified {
+                    range: start + argv0_range.start..start + argv0_range.end,
+                    reason: "the executable-assignment model exceeds the bounded binding limit",
+                });
+            invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+            continue;
+        }
+        let Some(binding) = bindings.get(&name) else {
             break;
         };
+        let value = match binding {
+            ModeledPosixBinding::Literal(value) => value,
+            ModeledPosixBinding::Unverified(reason) => {
+                model
+                    .invocations
+                    .push(ModeledPosixExecutableInvocation::Unverified {
+                        range: start + argv0_range.start..start + argv0_range.end,
+                        reason,
+                    });
+                invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+                continue;
+            }
+        };
+        let (replacement, split_inline_launcher) =
+            match render_posix_executable_expansion(value, quoted, ifs) {
+                Ok(expansion) => expansion,
+                Err(reason) => {
+                    model
+                        .invocations
+                        .push(ModeledPosixExecutableInvocation::Unverified {
+                            range: start + argv0_range.start..start + argv0_range.end,
+                            reason,
+                        });
+                    invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+                    continue;
+                }
+            };
+        let resolved_bytes = segment.len() - argv0_range.len() + replacement.len();
+        reconstructed_bytes = reconstructed_bytes.saturating_add(resolved_bytes);
+        if reconstructed_bytes > crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES {
+            model
+                .invocations
+                .push(ModeledPosixExecutableInvocation::Unverified {
+                    range: start..end,
+                    reason: "the executable assignments exceed the bounded reconstructed-command limit",
+                });
+            return model;
+        }
         let mut resolved = String::with_capacity(
             segment.len() + replacement.len().saturating_sub(argv0_range.len()),
         );
         resolved.push_str(&segment[..argv0_range.start]);
-        resolved.push_str(replacement);
+        resolved.push_str(&replacement);
         resolved.push_str(&segment[argv0_range.end..]);
+        let may_mutate_bindings = modeled_posix_invocation_may_mutate_bindings(&resolved);
+        model.inert_ranges.append(&mut assignment_ranges);
         model.inert_ranges.push(start..end);
-        model.invocations.push(ResolvedPosixExecutableInvocation {
-            segment_range: start..end,
-            argv0_range,
-            replacement_len: replacement.len(),
-            command: resolved,
-        });
+        model
+            .invocations
+            .push(ModeledPosixExecutableInvocation::Resolved(
+                ResolvedPosixExecutableInvocation {
+                    segment_range: start..end,
+                    argv0_range,
+                    replacement_len: replacement.len(),
+                    command: resolved,
+                    split_inline_launcher,
+                },
+            ));
+        if may_mutate_bindings {
+            invalidate_modeled_posix_bindings(&mut bindings, &mut ifs);
+        }
     }
     if model.invocations.is_empty() {
         return PosixExecutableAssignmentModel::default();
@@ -13628,6 +14226,62 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     nested_command_depth: usize,
     inherited_automated_stdin: bool,
 ) -> EvaluationResult {
+    // Required trusted policy must be intact before any authorization path (#568).
+    if let Some(reason) = compiled_overrides.configuration_error.as_deref() {
+        return EvaluationResult::denied_by_config(reason.to_string());
+    }
+
+    let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+    let mut result = evaluate_command_in_dialect_union(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        shell_dialect,
+        nested_command_depth,
+        inherited_automated_stdin,
+    );
+    // A positive denial remains decisive. An exact-command grant explicitly
+    // authorizes the whole request. Every other would-be allow (including a
+    // warn/log result or a rule-scoped exemption) requires complete analysis.
+    // A failed regex search is not a successful proof that no rule matched,
+    // and neither is an embedded-source proof that could not finish.
+    if scope.has_failed() && result.bypass_method != Some(BypassMethod::AllowOnce) {
+        if result.decision != EvaluationDecision::Deny {
+            result = EvaluationResult {
+                decision: EvaluationDecision::Indeterminate,
+                ..EvaluationResult::allowed()
+            };
+        }
+        result.regex_evaluation_incomplete = true;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_command_in_dialect_union(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+) -> EvaluationResult {
+    let _phase = phase(ProfilePhase::Evaluation);
+    let _trace_phase = crate::perf::PhaseTimer::start("evaluation_total");
     let primary = evaluate_command_in_single_dialect_view(
         command,
         enabled_keywords,
@@ -13801,10 +14455,13 @@ fn evaluate_command_in_single_dialect_view(
     // bodies, launcher payloads, and substitutions passes a deeper depth and
     // does not get this exemption; a dcg diagnostic that really is the whole
     // body still hits the Step 2 whole-command exemption on its own.
-    let dcg_masked = if nested_command_depth == 0 {
-        mask_dcg_self_inspection_segments(command)
-    } else {
-        Cow::Borrowed(command)
+    let dcg_masked = {
+        let _phase = phase(ProfilePhase::Normalization);
+        if nested_command_depth == 0 {
+            mask_dcg_self_inspection_segments(command)
+        } else {
+            Cow::Borrowed(command)
+        }
     };
     let command: &str = dcg_masked.as_ref();
 
@@ -13859,6 +14516,29 @@ fn evaluate_command_in_single_dialect_view(
     // their tokens (issue #289). A dynamic assignment keeps the established
     // fail-closed path.
     for invocation in &posix_executable_model.invocations {
+        let invocation = match invocation {
+            ModeledPosixExecutableInvocation::Resolved(invocation) => invocation,
+            ModeledPosixExecutableInvocation::Unverified { range, reason } => {
+                if let Some(mut denial) = launcher_unverified_denial(
+                    POSIX_EXECUTABLE_UNVERIFIED_RULE,
+                    reason,
+                    allowlists,
+                    project_path,
+                    &mut heredoc_allowlist_hit,
+                ) {
+                    if let Some(info) = denial.pattern_info.as_mut() {
+                        let span = MatchSpan {
+                            start: range.start,
+                            end: range.end,
+                        };
+                        info.matched_span = Some(span);
+                        info.matched_text_preview = Some(extract_match_preview(command, &span));
+                    }
+                    return denial;
+                }
+                continue;
+            }
+        };
         let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
             &invocation.command,
             enabled_keywords,
@@ -13879,6 +14559,17 @@ fn evaluate_command_in_single_dialect_view(
             return result;
         }
         record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
+        if invocation.split_inline_launcher
+            && let Some(denial) = launcher_unverified_denial(
+                POSIX_INLINE_LAUNCHER_UNVERIFIED_RULE,
+                "Field splitting introduces an interpreter's inline-code options from an executable variable; this launcher form requires explicit review",
+                allowlists,
+                project_path,
+                &mut heredoc_allowlist_hit,
+            )
+        {
+            return denial;
+        }
     }
     // `$IFS`/`${IFS}` word-splits to whitespace by default, so
     // `rm${IFS}-rf${IFS}~` runs `rm -rf ~` while presenting no whitespace the
@@ -14161,7 +14852,10 @@ fn evaluate_command_in_single_dialect_view(
         }
 
         if check_triggers(command) == TriggerResult::Triggered {
-            let sanitized = sanitize_for_pattern_matching(command);
+            let sanitized = {
+                let _phase = phase(ProfilePhase::Normalization);
+                sanitize_for_pattern_matching(command)
+            };
             let sanitized_str = sanitized.as_ref();
             let should_scan = if matches!(sanitized, std::borrow::Cow::Owned(_)) {
                 check_triggers(sanitized_str) == TriggerResult::Triggered
@@ -14248,6 +14942,13 @@ fn evaluate_command_in_single_dialect_view(
 
     // Step 4: Quick rejection - if no relevant keywords, allow immediately.
     //
+    // Keyword gating reads the command without its inert redirections
+    // (`2>/dev/null`, `2>&1`, `</dev/null`, ...): their bytes spell the
+    // redirect and `/dev/` keywords, yet no rule can match them, and they
+    // made an ordinary `ls 2>/dev/null` compile two packs (#571). Rule
+    // matching below still reads the full command.
+    let gating_command = inert_redirection_gating_view(command, shell_dialect);
+    //
     // Fast path: when an Aho-Corasick keyword index is available, a single-pass
     // AC scan (O(n)) replaces the N×memmem per-keyword scan. If the AC says no
     // keyword appears in the raw command, we can skip the more expensive
@@ -14262,7 +14963,7 @@ fn evaluate_command_in_single_dialect_view(
             && tar_helper_sources.is_empty()
             && !crate::packs::get_external_packs()
                 .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
-            && !index.has_any_keyword(command)
+            && !index.has_any_keyword(gating_command.as_ref())
             && !contains_shell_word_obfuscation(command, shell_dialect)
             && !force_core_git
             && !force_core_filesystem
@@ -14286,10 +14987,17 @@ fn evaluate_command_in_single_dialect_view(
         && force_literal_database_packs.is_empty()
         && !force_windows_filesystem
         && !force_scp_semantics
-        && pack_aware_quick_reject(
-            crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
-            enabled_keywords,
-        )
+        && {
+            let _phase = phase(ProfilePhase::Normalization);
+            pack_aware_quick_reject(
+                inert_redirection_gating_view(
+                    crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
+                    shell_dialect,
+                )
+                .as_ref(),
+                enabled_keywords,
+            )
+        }
     {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
@@ -14313,6 +15021,7 @@ fn evaluate_command_in_single_dialect_view(
     // or an unmatched apostrophe, both of which are ordinary bytes in Cmd.
     // Start from the original command for a proven Cmd hook and let the native
     // token overlay below perform the safe-data masking.
+    let normalization_phase = phase(ProfilePhase::Normalization);
     let sanitized = if shell_dialect == ShellDialect::Cmd {
         Cow::Borrowed(command)
     } else {
@@ -14374,6 +15083,17 @@ fn evaluate_command_in_single_dialect_view(
     } else {
         pack_aware_quick_reject_with_normalized(dialect_normalized.as_ref(), enabled_keywords)
     };
+    // The same gating view as Step 4, over the normalized command. The
+    // normalized text itself, not this view, is what the packs match.
+    let quick_reject = quick_reject
+        || matches!(
+            inert_redirection_gating_view(normalized.as_ref(), shell_dialect),
+            Cow::Owned(ref gating) if crate::packs::pack_aware_quick_reject_normalized_view(
+                gating,
+                enabled_keywords,
+            )
+        );
+    drop(normalization_phase);
     if sed_shell_sources.is_empty()
         && tar_helper_sources.is_empty()
         && quick_reject
@@ -14514,10 +15234,11 @@ fn evaluate_command_in_single_dialect_view(
         allow_once_audit,
         inherited_automated_stdin,
     };
-    let result = evaluate_packs_with_allowlists_at_depth(
+    let mut result = evaluate_packs_with_allowlists_at_depth(
         command_for_packs,
         &normalized,
         command_for_match,
+        command,
         command,
         ordered_packs,
         allowlists,
@@ -14529,6 +15250,65 @@ fn evaluate_command_in_single_dialect_view(
         Some(&nested_context),
         inherited_automated_stdin,
     );
+    // The packs also read the command's argv view: the same text with every
+    // redirection blank-filled (`crate::heredoc::redirection_free_view`).
+    // A redirect is never an argument, yet rules that read argv positions saw
+    // one, wherever it stood: before or glued to the command word, it took
+    // the executable position, and after the operand a rule expects last, it
+    // ended the command early. Deny wins between the two readings, exactly as
+    // between dialect views; the full reading keeps every redirect target for
+    // the rules about those. Where each command's input comes from is still
+    // read from the full command: the view blanks the input redirections and
+    // heredocs that say it, and a client whose input looked unknown there
+    // would be refused for want of the input the full reading verified.
+    if result.decision == EvaluationDecision::Allow
+        && let Some(views) = redirection_free_pack_views(command, command_for_match, shell_dialect)
+    {
+        if deadline_exceeded(deadline) {
+            return EvaluationResult::indeterminate_due_to_budget();
+        }
+        let argv_result = evaluate_packs_with_allowlists_at_depth(
+            &views.for_packs,
+            &views.normalized,
+            &views.for_match,
+            &views.command,
+            command,
+            ordered_packs,
+            allowlists,
+            keyword_index,
+            deadline,
+            project_path,
+            shell_dialect,
+            nested_command_depth,
+            Some(&nested_context),
+            inherited_automated_stdin,
+        );
+        let adopt = match argv_result.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => true,
+            EvaluationDecision::Allow => {
+                result.effective_mode.is_none() && argv_result.effective_mode.is_some()
+            }
+        };
+        if adopt {
+            result = argv_result;
+            // The view is length preserving, so the span is the same span
+            // of the command; preview the command's own text, not blanks.
+            // A blanked multi-byte character can leave an end inside it.
+            if let Some(info) = result.pattern_info.as_mut()
+                && let Some(span) = info.matched_span.as_mut()
+            {
+                span.end = span.end.min(command.len());
+                span.start = span.start.min(span.end);
+                while !command.is_char_boundary(span.start) {
+                    span.start -= 1;
+                }
+                while !command.is_char_boundary(span.end) {
+                    span.end += 1;
+                }
+                info.matched_text_preview = Some(extract_match_preview(command, span));
+            }
+        }
+    }
     // Attribute an ALLOW outcome to the recorded heredoc/launcher allowlist
     // grant — but never let that attribution replace a pack denial or an
     // indeterminate verdict. A grant scoped to e.g.
@@ -14542,6 +15322,78 @@ fn evaluate_command_in_single_dialect_view(
     }
 
     result
+}
+
+/// The four pack-evaluation views of a command's argv view (see
+/// [`crate::heredoc::redirection_free_view`]), in the roles
+/// [`evaluate_packs_with_allowlists_at_depth`] takes them.
+struct RedirectionFreePackViews {
+    command: String,
+    for_match: String,
+    normalized: String,
+    for_packs: String,
+}
+
+/// Build the argv-view counterparts of `command` and of its byte-aligned
+/// match view, or `None` when the command has no redirection outside quotes.
+///
+/// Each dialect reads its own redirection syntax: POSIX (which the unknown
+/// dialect reads too) with [`crate::heredoc::redirection_free_view`], Cmd and
+/// PowerShell with [`windows_redirection_free_view`]. The match view keeps
+/// its own masking: the bytes the argv view blanks are blanked in it as well.
+/// Only if it is not byte-aligned with the command is it rebuilt from the
+/// argv view, as the match view itself is built (the generic sanitizer,
+/// which Cmd skips), masking less, never more.
+fn redirection_free_pack_views(
+    command: &str,
+    command_for_match: &str,
+    shell_dialect: ShellDialect,
+) -> Option<RedirectionFreePackViews> {
+    let argv_command = match shell_dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            crate::heredoc::redirection_free_view(command)?
+        }
+        ShellDialect::Cmd | ShellDialect::PowerShell => {
+            windows_redirection_free_view(command, shell_dialect)?
+        }
+    };
+    let for_match = (command_for_match.len() == command.len())
+        .then(|| {
+            let mut bytes = command_for_match.as_bytes().to_vec();
+            for ((byte, view), raw) in bytes
+                .iter_mut()
+                .zip(argv_command.as_bytes())
+                .zip(command.as_bytes())
+            {
+                if view != raw {
+                    *byte = b' ';
+                }
+            }
+            String::from_utf8(bytes).ok()
+        })
+        .flatten()
+        .unwrap_or_else(|| {
+            if shell_dialect == ShellDialect::Cmd {
+                argv_command.clone()
+            } else {
+                sanitize_for_pattern_matching(&argv_command).into_owned()
+            }
+        });
+    let dialect_normalized =
+        crate::normalize::normalize_command_in_dialect(&for_match, shell_dialect);
+    // As in the full reading, Cmd's dialect normalization is the last pass.
+    let normalized = if shell_dialect == ShellDialect::Cmd {
+        dialect_normalized.into_owned()
+    } else {
+        crate::normalize::normalize_command(dialect_normalized.as_ref()).into_owned()
+    };
+    let for_packs = crate::heredoc::mask_non_executing_heredocs(&normalized).into_owned();
+    Some(RedirectionFreePackViews {
+        command: argv_command,
+        for_match,
+        normalized,
+        for_packs,
+    })
 }
 
 /// Carry the original command's data-body proof into the byte-aligned regex
@@ -14586,6 +15438,12 @@ fn preserve_source_heredoc_data_mask<'a>(
     String::from_utf8(result).map_or(Cow::Borrowed(command_for_match), Cow::Owned)
 }
 
+#[cfg(test)]
+thread_local! {
+    // Documentation-mask analyses actually launched on this thread (#555).
+    static DOCUMENTATION_MASK_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Withdraw shell syntax invented from proven Python/JavaScript documentation
 /// literals (#544). Only the final shell matching view uses this mask. The
 /// complete original body remains input to interpreter, execution, pipeline,
@@ -14600,28 +15458,69 @@ fn mask_proven_interpreter_documentation(command: &str) -> Cow<'_, str> {
     // The deadline covers extraction and both the Bash receiver proof and
     // the Python/JavaScript parse. Node/byte limits alone do not bound the
     // parser's wall time (git_safety_guard-bl1c).
-    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let source = command.to_string();
-    run_documentation_mask_worker(
-        &ACTIVE,
-        crate::ast_matcher::protected_scan_budget(),
-        move || match mask_proven_interpreter_documentation_inner(&source) {
-            Cow::Owned(masked) => Some(masked),
-            Cow::Borrowed(_) => None,
-        },
-    )
-    .map_or(Cow::Borrowed(command), Cow::Owned)
+    //
+    // One worker slot per evaluating thread, not per process: concurrent
+    // evaluations (the MCP server, a parallel hook batch, parallel tests)
+    // must not lose each other's proof merely by overlapping (#565).
+    thread_local! {
+        static ACTIVE: std::sync::Arc<std::sync::atomic::AtomicBool> =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Completed analyses of recent sources. The mask is a pure function
+        // of the command text, and the per-segment pack passes ask for the
+        // same complete command once per segment: a 300-line documentation
+        // heredoc used to re-extract and re-parse the whole command about
+        // fifty times per hook (#555). Only finished analyses are kept; a
+        // timeout or busy slot is asked again, exactly as before.
+        static COMPLETED: std::cell::RefCell<
+            std::collections::VecDeque<(String, Option<String>)>,
+        > = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+    const COMPLETED_CAPACITY: usize = 4;
+    let cached = COMPLETED.with(|completed| {
+        completed
+            .borrow()
+            .iter()
+            .find(|(source, _)| source == command)
+            .map(|(_, mask)| mask.clone())
+    });
+    let completed = cached.or_else(|| {
+        #[cfg(test)]
+        DOCUMENTATION_MASK_ANALYSES.with(|count| count.set(count.get() + 1));
+        let source = command.to_string();
+        let mask = run_documentation_mask_worker(
+            ACTIVE.with(std::sync::Arc::clone),
+            crate::ast_matcher::protected_scan_budget(),
+            move || {
+                Some(match mask_proven_interpreter_documentation_inner(&source) {
+                    Cow::Owned(masked) => Some(masked),
+                    Cow::Borrowed(_) => None,
+                })
+            },
+        )?;
+        COMPLETED.with(|completed| {
+            let mut completed = completed.borrow_mut();
+            if completed.len() == COMPLETED_CAPACITY {
+                completed.pop_front();
+            }
+            completed.push_back((command.to_string(), mask.clone()));
+        });
+        Some(mask)
+    });
+    completed
+        .flatten()
+        .map_or(Cow::Borrowed(command), Cow::Owned)
 }
 
-/// At most one parser may outlive its optional documentation proof. The
-/// permit remains owned through timeout or panic until analysis finishes; a
-/// busy slot keeps the conservative source view instead of spawning more work.
-fn run_documentation_mask_worker(
-    active: &'static std::sync::atomic::AtomicBool,
+/// At most one parser per slot may outlive its optional documentation proof.
+/// The permit remains owned through timeout or panic until analysis finishes;
+/// a busy slot keeps the conservative source view instead of spawning more work.
+fn run_documentation_mask_worker<T: Send + 'static>(
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     budget: std::time::Duration,
-    analyze: impl FnOnce() -> Option<String> + Send + 'static,
-) -> Option<String> {
+    analyze: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
     use std::sync::atomic::Ordering;
+    let _phase = phase(ProfilePhase::AstMatch);
     let started = std::time::Instant::now();
     if budget.is_zero()
         || active
@@ -14630,7 +15529,7 @@ fn run_documentation_mask_worker(
     {
         return None;
     }
-    struct Permit(&'static std::sync::atomic::AtomicBool);
+    struct Permit(std::sync::Arc<std::sync::atomic::AtomicBool>);
     impl Drop for Permit {
         fn drop(&mut self) {
             self.0.store(false, Ordering::Release);
@@ -14638,10 +15537,15 @@ fn run_documentation_mask_worker(
     }
     let permit = Permit(active);
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let profile = crate::perf::capture_profile();
     let _worker = std::thread::Builder::new()
         .name("dcg-documentation-proof".into())
         .spawn(move || {
-            let result = analyze();
+            let result = {
+                let _profile = profile.enter();
+                let _phase = phase(ProfilePhase::AstMatch);
+                analyze()
+            };
             // The closure and all parser/source state are gone before the
             // permit is released. The buffered send cannot block a worker.
             drop(permit);
@@ -15123,7 +16027,7 @@ fn collect_indirect_input_flows_at_depth(
         return Vec::new();
     }
 
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         return vec![unverified_indirect_wildcard(
             "shell syntax could not be parsed for indirect-input analysis".to_string(),
@@ -16441,7 +17345,7 @@ fn protected_consumer_pack_at_depth(command: &str, shell_depth: usize) -> Option
         }
     }
 
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         return None;
     }
@@ -17973,7 +18877,7 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
     // The entire producer must be this one statement. Selecting the first
     // heredoc from `(cat <<EOF ... EOF; printf more_code)` would discard
     // executable bytes emitted by the rest of the subshell.
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     let statements: Vec<_> = ast
         .root()
         .children()
@@ -18742,7 +19646,7 @@ fn tar_callsite_may_write_files(command: &str) -> bool {
     if command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
         return true;
     }
-    let ast = AstGrep::new(command, SupportLang::Bash);
+    let ast = crate::heredoc::parse_shell_ast(command);
     if ast_contains_error(ast.root()) {
         return true;
     }
@@ -18797,7 +19701,7 @@ fn tar_invocation_ranges(
         // invocation owns the source, retain the existing bounded fallback.
         return ranges;
     }
-    let Ok(ast) = AstGrep::try_new(command, SupportLang::Bash) else {
+    let Ok(ast) = crate::heredoc::try_parse_shell_ast(command) else {
         return ranges;
     };
     if ast.root().get_inner_node().has_error() {
@@ -22459,6 +23363,7 @@ fn evaluate_indirect_inputs_for_pack(
                             &command,
                             &command,
                             &command,
+                            &command,
                             ordered_packs,
                             allowlists,
                             keyword_index,
@@ -22942,6 +23847,7 @@ fn evaluate_packs_with_allowlists(
         normalized,
         command_for_match,
         original_command,
+        original_command,
         ordered_packs,
         allowlists,
         keyword_index,
@@ -22954,6 +23860,12 @@ fn evaluate_packs_with_allowlists(
     )
 }
 
+/// `input_command` is the text whose redirections and pipelines say where
+/// each command's standard input comes from: the indirect input of the
+/// database and DNS clients, and the client a heredoc payload is attributed
+/// to. It is `original_command` except in the argv reading, whose
+/// `original_command` has every redirection blanked; there the full command
+/// still answers where input comes from.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 fn evaluate_packs_with_allowlists_at_depth(
@@ -22961,6 +23873,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     normalized: &str,
     command_for_match: &str,
     original_command: &str,
+    input_command: &str,
     ordered_packs: &[String],
     allowlists: &LayeredAllowlist,
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
@@ -22971,6 +23884,8 @@ fn evaluate_packs_with_allowlists_at_depth(
     nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
     inherited_automated_stdin: bool,
 ) -> EvaluationResult {
+    let _phase = phase(ProfilePhase::PatternEvaluation);
+    let _trace_phase = crate::perf::PhaseTimer::start("pattern_evaluation");
     if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
         return EvaluationResult::indeterminate_due_to_budget();
     }
@@ -22984,7 +23899,8 @@ fn evaluate_packs_with_allowlists_at_depth(
     // within the database family changes, so every pack still runs and no
     // denial can be lost; first match wins, so the carrier's own dialect is
     // the one named.
-    let carrier_ordered_packs = database_carrier_first(ordered_packs, original_command);
+    let selection_phase = phase(ProfilePhase::PatternSelection);
+    let carrier_ordered_packs = database_carrier_first(ordered_packs, input_command);
     let ordered_packs = carrier_ordered_packs.as_deref().unwrap_or(ordered_packs);
 
     // Pre-compute which packs might match.
@@ -23008,8 +23924,7 @@ fn evaluate_packs_with_allowlists_at_depth(
             original_command,
             shell_dialect,
         );
-    let core_filesystem_keyword_candidate =
-        crate::packs::core::filesystem::filesystem_keyword_candidate(command_for_packs);
+
     let force_windows_filesystem = ordered_packs
         .iter()
         .any(|pack_id| pack_id == "windows.filesystem")
@@ -23043,6 +23958,11 @@ fn evaluate_packs_with_allowlists_at_depth(
         );
     let force_literal_database_packs =
         literal_substitution_database_packs(original_command, shell_dialect);
+    // Inert redirections select no pack (#571); rules still match the text.
+    let gating_command = inert_redirection_gating_view(command_for_packs, shell_dialect);
+    let gating_command = gating_command.as_ref();
+    let core_filesystem_keyword_candidate =
+        crate::packs::core::filesystem::filesystem_keyword_candidate(gating_command);
     let candidate_pack_ids: Vec<&String> = keyword_index.map_or_else(
         || {
             ordered_packs
@@ -23051,7 +23971,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     let pack_id = *pack_id;
                     // Try built-in registry first
                     if let Some(entry) = REGISTRY.get_entry(pack_id) {
-                        return entry.might_match(command_for_packs)
+                        return entry.might_match(gating_command)
                             && (pack_id != "core.filesystem" || core_filesystem_keyword_candidate)
                             || force_core_git && pack_id == "core.git"
                             || force_core_filesystem && pack_id == "core.filesystem"
@@ -23074,7 +23994,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     external_store
                         .and_then(|store| store.get(pack_id))
                         .is_some_and(|pack| {
-                            pack.might_match(command_for_packs)
+                            pack.might_match(gating_command)
                                 || should_check_original_control_plane_payload(
                                     pack_id,
                                     command_for_packs,
@@ -23085,7 +24005,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 .collect()
         },
         |index| {
-            let mask = index.candidate_pack_mask(command_for_packs);
+            let mask = index.candidate_pack_mask(gating_command);
             ordered_packs
                 .iter()
                 .enumerate()
@@ -23128,6 +24048,8 @@ fn evaluate_packs_with_allowlists_at_depth(
         },
     );
 
+    drop(selection_phase);
+    let preparation_phase = phase(ProfilePhase::PatternPreparation);
     let normalized_offset = compute_normalized_offset(command_for_match, normalized);
     let original_len = original_command.len();
     let segment_ranges = command_segment_ranges_in_dialect(command_for_packs, shell_dialect);
@@ -23212,14 +24134,14 @@ fn evaluate_packs_with_allowlists_at_depth(
         .any(|pack_id| is_indirect_input_pack(pack_id));
     let indirect_input_flows = if has_indirect_input_pack {
         let mut flows = collect_indirect_input_flows(
-            original_command,
-            &command_segment_ranges(original_command),
+            input_command,
+            &command_segment_ranges(input_command),
             shell_dialect,
         );
         for flow in collect_dialect_snowflake_flows(
-            original_command,
+            input_command,
             shell_dialect,
-            command_segment_ranges_in_dialect(original_command, shell_dialect).len() > 1,
+            command_segment_ranges_in_dialect(input_command, shell_dialect).len() > 1,
         ) {
             push_indirect_flow(&mut flows, flow);
         }
@@ -23260,8 +24182,14 @@ fn evaluate_packs_with_allowlists_at_depth(
     //
     // The rm_parse optimization for core.filesystem is handled inline.
     let mut first_allowlist_hit: Option<(PatternMatch, AllowlistLayer, String)> = None;
+    // Set when the bounded Windows filesystem pass stopped before reading
+    // every statement. Only a denial may follow it; an allow becomes the
+    // configured incomplete-analysis outcome below.
+    let mut windows_filesystem_analysis_incomplete = false;
 
+    drop(preparation_phase);
     for &pack_id in &candidate_pack_ids {
+        let _rule_phase = phase(ProfilePhase::PatternRules);
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return EvaluationResult::indeterminate_due_to_budget();
         }
@@ -23438,6 +24366,17 @@ fn evaluate_packs_with_allowlists_at_depth(
                         return result;
                     }
                     continue;
+                }
+                crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::Incomplete => {
+                    // The pass hit its size or statement bound before reading
+                    // every statement: no rule was verified either way. Run
+                    // this pack's patterns over the whole text (a visible
+                    // destructive spelling still denies under its own rule) and
+                    // let the end of this evaluation report the configured
+                    // incomplete-analysis outcome instead of an allow — never a
+                    // `windows-filesystem-semantic-unverified` finding the pass
+                    // did not make (#569).
+                    windows_filesystem_analysis_incomplete = true;
                 }
                 crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch
                     if shell_dialect != ShellDialect::Unknown =>
@@ -24252,6 +25191,12 @@ fn evaluate_packs_with_allowlists_at_depth(
     }
 
     if deadline_exceeded(deadline) {
+        return EvaluationResult::indeterminate_due_to_budget();
+    }
+
+    // An unread remainder is not a clean one, and a rule-scoped allowlist hit
+    // elsewhere does not authorize what was never analyzed.
+    if windows_filesystem_analysis_incomplete {
         return EvaluationResult::indeterminate_due_to_budget();
     }
 
@@ -25286,7 +26231,7 @@ fn literal_loop_redirect_values(
     {
         return None;
     }
-    let ast = AstGrep::try_new(source, SupportLang::Bash).ok()?;
+    let ast = crate::heredoc::try_parse_shell_ast(source).ok()?;
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -25488,10 +26433,20 @@ fn literal_bash_source_range(
             })
             .then(|| range.clone());
     }
-    if !bash || nonlocal {
+    // `ssh destination '<script>'` hands these exact single-quoted bytes to
+    // the remote shell as its command line: the inline counterpart of the
+    // quoted `ssh destination <<'EOF'` body above (#554). The same POSIX
+    // receiver model applies, and so does the #534 boundary: the proofs that
+    // consume this range are lexical (literal /tmp bindings, `mktemp -d`
+    // folds) and the evaluation that uses them keeps the remote filesystem
+    // scope, so nothing from the caller's filesystem is borrowed. The AST
+    // walk below still requires the exact `ssh destination '<script>'` argv.
+    let ssh_inline =
+        content.heredoc_type.is_none() && content.target_command.as_deref() == Some("ssh");
+    if (!bash || nonlocal) && !ssh_inline {
         return None;
     }
-    let ast = AstGrep::try_new(command, SupportLang::Bash).ok()?;
+    let ast = crate::heredoc::try_parse_shell_ast(command).ok()?;
     if ast.root().get_inner_node().has_error() {
         return None;
     }
@@ -25511,18 +26466,30 @@ fn literal_bash_source_range(
                 .children()
                 .filter(ast_grep_core::Node::is_named)
                 .collect();
-            let [program, flag, argument] = words.as_slice() else {
+            let [program, operand, argument] = words.as_slice() else {
                 return None;
             };
+            let program_name = program.text();
+            let operand_text = operand.text();
+            // A local POSIX shell's `-c` script, or (only for an extracted
+            // ssh payload) a direct ssh session with one literal destination
+            // and no options: options and remote argv words are outside this
+            // proof, exactly as they are for the heredoc receiver.
+            let shell_script = bash
+                && !nonlocal
+                && literal_posix_shell_program(program_name.as_ref())
+                && operand_text.as_ref() == "-c";
+            let ssh_script = ssh_inline
+                && matches!(program_name.as_ref(), "ssh" | "/bin/ssh" | "/usr/bin/ssh")
+                && literal_ssh_destination(operand_text.as_ref());
             if program.kind().as_ref() != "command_name"
-                || !literal_posix_shell_program(program.text().as_ref())
-                || flag.kind().as_ref() != "word"
-                || flag.text().as_ref() != "-c"
+                || operand.kind().as_ref() != "word"
+                || !(shell_script || ssh_script)
                 || argument.range() != node.range()
                 || crate::heredoc::stdin_data_sink_may_be_overridden(
                     command,
                     program.range().end,
-                    program.text().as_ref(),
+                    program_name.as_ref(),
                 )
             {
                 return None;
@@ -25553,6 +26520,18 @@ fn literal_posix_shell_program(program: &str) -> bool {
         .or_else(|| program.strip_prefix("/usr/bin/"))
         .unwrap_or(program);
     matches!(name, "bash" | "sh" | "dash" | "ksh" | "zsh")
+}
+
+/// An ssh destination the local shell passes through unchanged: one plain
+/// word that cannot be an option and carries no expansion, quoting or glob.
+/// Any other spelling could add ssh options or remote argv words in front of
+/// the script, which the inline ssh ownership proof does not model.
+fn literal_ssh_destination(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b'.' | b'_' | b'-' | b':')
+        })
 }
 
 /// Keep proven redirects tied to their owning embedded Bash body. These
@@ -25719,10 +26698,16 @@ fn resolve_variable_bindings(
                         .is_some_and(|prefix| prefix.trim_end().ends_with("&&"))
                     && conditional_binding_dominates_redirect(source, end, segment_start)));
         if binds_in_parent {
-            if let Some(raw) = strip_assignment_declaration(segment)
-                .strip_prefix(name)
-                .and_then(|rest| rest.strip_prefix('='))
-            {
+            let assignments = strip_assignment_declaration(segment);
+            let binding = match assignment_only_segment_binding(assignments, name) {
+                AssignmentOnlyBinding::NotAssignmentOnly => assignments
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('=')),
+                AssignmentOnlyBinding::Binds(raw) => Some(raw),
+                AssignmentOnlyBinding::DoesNotBind => None,
+                AssignmentOnlyBinding::Ambiguous => return None,
+            };
+            if let Some(raw) = binding {
                 if values.is_some() {
                     return None;
                 }
@@ -25792,15 +26777,17 @@ fn resolve_variable_bindings(
             // and cannot change what a later `$NAME` expands to (#422).
             // Checked against `source`, not `segment`: printf's arguments are
             // stripped as data before this scan, so the segment is bare.
-            "printf" => command_word_was_quoted || printf_can_bind_variable(source),
+            "printf" => command_word_was_quoted || printf_can_bind_variable(source, name),
+            // `read` binds only the variables it names, `REPLY` when it names
+            // none, and its `-a` array (#574). Same source-level scan.
+            "read" => command_word_was_quoted || read_can_bind_variable(source, name),
             // These invalidate permission-lifting proofs. The deny-only
             // pass retains the earlier literal as a conservative candidate,
             // so adding this guard cannot hide an existing sensitive target.
             "trap" | "alias" => !matches!(mode, VariableResolution::DenyOnlyLiteral),
             other => matches!(
                 other,
-                "read"
-                    | "readonly"
+                "readonly"
                     | "declare"
                     | "typeset"
                     | "local"
@@ -25980,7 +26967,7 @@ fn printf_argument_end(after: &str) -> usize {
     bytes.len()
 }
 
-fn printf_can_bind_variable(source: &str) -> bool {
+fn printf_can_bind_variable(source: &str, name: &str) -> bool {
     let mut rest = source;
     while let Some(index) = rest.find("printf") {
         let after = &rest[index + "printf".len()..];
@@ -26019,26 +27006,48 @@ fn printf_can_bind_variable(source: &str) -> bool {
             {
                 return true;
             }
-            // Every word is inspected, including anything that looks like a
-            // redirect. A redirect may legally precede the arguments —
-            // `printf > /dev/null -v p /etc/passwd` binds `p` in bash — so
-            // stopping at the first `>` would walk straight past the flag that
-            // matters. Scanning through costs only a false *hazard* when
-            // printf's own redirect target is dynamic, which denies, and
-            // denying is the safe direction here.
-            for word in args.split_ascii_whitespace() {
-                // `-v NAME` and the concatenated `-vNAME` both bind, and an
-                // expansion could become either at run time.
-                //
-                // The quote and backslash bytes belong here too: bash strips
-                // them before the builtin sees its argv, so `printf "-v" p /x`,
-                // `printf '-v' p /x`, `printf -"v" p /x` and `printf \-v p /x`
-                // all bind exactly as the bare spelling does — verified in bash
-                // 5.3. Dropping them from this set turned each into an allowed
-                // `rm -rf`. Fail closed on anything this cannot read literally.
-                if word.starts_with("-v") || word.contains(['$', '`', '\\', '\'', '"']) {
+            // Options end at printf's format, its first non-option word, so
+            // only the words before it are read (#574): `printf a "$(true)"`
+            // binds nothing, because bash never parses `$(true)` as an option.
+            let mut words = args.split_ascii_whitespace();
+            while let Some(word) = words.next() {
+                // The quote and backslash bytes are hazards wherever an option
+                // may still appear: bash strips them before the builtin sees
+                // its argv, so `printf "-v" p /x`, `printf '-v' p /x`,
+                // `printf -"v" p /x` and `printf \-v p /x` all bind exactly as
+                // the bare spelling does — verified in bash 5.3. Dropping them
+                // turned each into an allowed `rm -rf`. An expansion, a glob
+                // or a brace expansion could likewise become `-v` at run time.
+                // Fail closed on anything this cannot read literally.
+                if word.contains(['$', '`', '\\', '\'', '"', '*', '?', '[', '{', '~']) {
                     return true;
                 }
+                // `-v NAME` and the concatenated `-vNAME` bind NAME (or the
+                // array NAME for `NAME[i]`). Binding a different, literally
+                // named variable leaves `name` alone (#574).
+                if let Some(attached) = word.strip_prefix("-v") {
+                    let target = if attached.is_empty() {
+                        words.next()
+                    } else {
+                        Some(attached)
+                    };
+                    let Some(target) = target else {
+                        return true;
+                    };
+                    if !printf_target_is_other_literal_variable(target, name) {
+                        return true;
+                    }
+                    continue;
+                }
+                // Any other option-like word (`-n`, `--`) keeps the scan in
+                // option position. bash rejects unknown options and honours
+                // `--`, but neither is modeled: reading on only costs a false
+                // hazard for a later `-v`.
+                if word.starts_with('-') {
+                    continue;
+                }
+                // The format: nothing after it is an option.
+                break;
             }
             // Resume AFTER this printf's own arguments, not just after the word.
             // A `printf` inside another printf's argument list is that printf's
@@ -26053,6 +27062,307 @@ fn printf_can_bind_variable(source: &str) -> bool {
         rest = after;
     }
     false
+}
+
+/// How one parent-shell segment that consists only of assignment words
+/// (`B=/tmp/b T=/tmp/t`) binds a variable (#574).
+#[derive(Debug, PartialEq, Eq)]
+enum AssignmentOnlyBinding<'a> {
+    /// Not a multi-word assignment-only segment: the single-assignment rules
+    /// apply unchanged.
+    NotAssignmentOnly,
+    /// The segment assigns `name` exactly once, with this raw value text.
+    Binds(&'a str),
+    /// The segment assigns only other variables.
+    DoesNotBind,
+    /// The segment assigns `name` more than once or by appending, assigns an
+    /// element of it, or changes `IFS`: no single value can be proven.
+    Ambiguous,
+}
+
+/// With no command word, every assignment word in a simple command is
+/// performed by the current shell, left to right, so each one is a binding
+/// exactly like a lone `NAME=value` segment. The previous single-assignment
+/// parse read `B=/tmp/b T=/tmp/t` as the value `/tmp/b T=/tmp/t` and lost the
+/// proof. A segment with a command word (`B=/tmp/b cmd`) only sets `B` for
+/// that command and stays outside this path.
+fn assignment_only_segment_binding<'a>(segment: &'a str, name: &str) -> AssignmentOnlyBinding<'a> {
+    let Some(words) = split_assignment_words(segment) else {
+        return AssignmentOnlyBinding::NotAssignmentOnly;
+    };
+    if words.len() < 2 {
+        return AssignmentOnlyBinding::NotAssignmentOnly;
+    }
+    let mut parsed = Vec::with_capacity(words.len());
+    for word in &words {
+        let Some(equals) = word.find('=') else {
+            return AssignmentOnlyBinding::NotAssignmentOnly;
+        };
+        let (target, append) = match word[..equals].strip_suffix('+') {
+            Some(target) => (target, true),
+            None => (&word[..equals], false),
+        };
+        let base = target.split_once('[').map_or(target, |(base, _)| base);
+        let valid_name = base
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && base
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !valid_name || (base.len() != target.len() && !target.ends_with(']')) {
+            return AssignmentOnlyBinding::NotAssignmentOnly;
+        }
+        parsed.push((
+            base,
+            target.len() != base.len() || append,
+            &word[equals + 1..],
+        ));
+    }
+    let mut binding = None;
+    for (base, element_or_append, value) in parsed {
+        if base == "IFS" {
+            return AssignmentOnlyBinding::Ambiguous;
+        }
+        if base != name {
+            continue;
+        }
+        if element_or_append || binding.is_some() {
+            return AssignmentOnlyBinding::Ambiguous;
+        }
+        binding = Some(value);
+    }
+    binding.map_or(
+        AssignmentOnlyBinding::DoesNotBind,
+        AssignmentOnlyBinding::Binds,
+    )
+}
+
+/// Raw words of an assignment-only simple command, split on unquoted blanks.
+/// Quoting, backslash escapes, `$( … )`, `${ … }` and backquotes stay inside
+/// the word that contains them. `None` when the text is not readable that way
+/// (unbalanced quoting or nesting, or a shell operator), which callers treat
+/// as "not an assignment-only segment".
+fn split_assignment_words(text: &str) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut words = Vec::new();
+    let mut word_start: Option<usize> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b' ' | b'\t' => {
+                if let Some(start) = word_start.take() {
+                    words.push(&text[start..index]);
+                }
+                index += 1;
+            }
+            b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' => return None,
+            byte => {
+                word_start.get_or_insert(index);
+                index = match byte {
+                    b'\\' => index + 2,
+                    b'\'' => index + 1 + text.get(index + 1..)?.find('\'')? + 1,
+                    b'"' => skip_double_quoted_word_part(text, index)?,
+                    b'`' => skip_backquoted_word_part(text, index)?,
+                    b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                        skip_dollar_group_word_part(text, index)?
+                    }
+                    _ => index + 1,
+                };
+            }
+        }
+    }
+    if index > bytes.len() {
+        return None;
+    }
+    if let Some(start) = word_start {
+        words.push(text.get(start..)?);
+    }
+    Some(words)
+}
+
+/// End offset (exclusive) of the double-quoted string opening at `start`.
+fn skip_double_quoted_word_part(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some(index + 1),
+            b'`' => index = skip_backquoted_word_part(text, index)?,
+            b'$' if matches!(bytes.get(index + 1), Some(b'(' | b'{')) => {
+                index = skip_dollar_group_word_part(text, index)?;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// End offset (exclusive) of the backquoted substitution opening at `start`.
+fn skip_backquoted_word_part(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'`' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// End offset (exclusive) of the `$( … )` or `${ … }` group opening at
+/// `start`, honouring nested groups and quoting inside it.
+fn skip_dollar_group_word_part(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (open, close) = match bytes.get(start + 1)? {
+        b'(' => (b'(', b')'),
+        b'{' => (b'{', b'}'),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'\'' => index += 1 + text.get(index + 1..)?.find('\'')? + 1,
+            b'"' => index = skip_double_quoted_word_part(text, index)?,
+            b'`' => index = skip_backquoted_word_part(text, index)?,
+            byte if byte == open => {
+                depth += 1;
+                index += 1;
+            }
+            byte if byte == close => {
+                depth -= 1;
+                index += 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Whether a `printf -v` / `read -a` target is a plain, literally spelled
+/// variable name other than `name`. Anything else — an expansion, quoting, an
+/// array subscript, or `name` itself — may bind `name` and is a hazard.
+fn printf_target_is_other_literal_variable(target: &str, name: &str) -> bool {
+    target != name
+        && target
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Whether a `read` command anywhere in `source` could bind `name` (#574).
+///
+/// `read` assigns only the variables it names (or `REPLY` when it names none,
+/// and the array given to `-a`), so `S=/tmp/x; read x; cat a > "$S/o"` cannot
+/// change `$S`. Like the printf scan this reads the original command text and
+/// is coarse in the safe direction: every `read` word in the command counts,
+/// and anything not statically readable — an expansion, quoting, a glob, an
+/// unknown option, a non-identifier name — is a hazard.
+fn read_can_bind_variable(source: &str, name: &str) -> bool {
+    let mut rest = source;
+    while let Some(index) = rest.find("read") {
+        let after = &rest[index + "read".len()..];
+        // Only a real command word counts; `readonly`, `fread` and
+        // `sys.stdin.read()` do not.
+        let joined_left = rest[..index]
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+        let joined_right = after
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_'));
+        if joined_left || joined_right {
+            rest = after;
+            continue;
+        }
+        let end = printf_argument_end(after);
+        if read_arguments_may_bind(&after[..end], name) {
+            return true;
+        }
+        rest = &after[end..];
+    }
+    false
+}
+
+fn read_arguments_may_bind(args: &str, name: &str) -> bool {
+    let mut words = args.split_ascii_whitespace();
+    let mut in_options = true;
+    let mut binds_named_variable = false;
+    while let Some(word) = words.next() {
+        // A redirection is not an operand. A bare operator owns the next word.
+        if let Some(target_attached) = redirect_operator_suffix(word) {
+            if target_attached.is_empty() {
+                words.next();
+            }
+            continue;
+        }
+        if word.contains(['$', '`', '\\', '\'', '"', '*', '?', '[', '{', '~', '(', ')']) {
+            return true;
+        }
+        if in_options && word == "--" {
+            in_options = false;
+            continue;
+        }
+        if in_options && word.len() > 1 && word.starts_with('-') {
+            let cluster = &word[1..];
+            for (offset, option) in cluster.char_indices() {
+                match option {
+                    'e' | 'E' | 'r' | 's' => {}
+                    'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u' => {
+                        let attached = &cluster[offset + 1..];
+                        let argument = if attached.is_empty() {
+                            words.next()
+                        } else {
+                            Some(attached)
+                        };
+                        let Some(argument) = argument else {
+                            return true;
+                        };
+                        if option == 'a' {
+                            if !printf_target_is_other_literal_variable(argument, name) {
+                                return true;
+                            }
+                            binds_named_variable = true;
+                        }
+                        break;
+                    }
+                    _ => return true,
+                }
+            }
+            continue;
+        }
+        in_options = false;
+        if !printf_target_is_other_literal_variable(word, name) {
+            return true;
+        }
+        binds_named_variable = true;
+    }
+    !binds_named_variable && name == "REPLY"
+}
+
+/// For a word that begins with a redirection operator, the text after the
+/// operator (empty when the target is the next word); `None` otherwise.
+fn redirect_operator_suffix(word: &str) -> Option<&str> {
+    let unnumbered = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let unnumbered = unnumbered.strip_prefix('&').unwrap_or(unnumbered);
+    for operator in ["<<<", "<<-", "<<", "<>", ">>", ">|", "<&", ">&", "<", ">"] {
+        if let Some(target) = unnumbered.strip_prefix(operator) {
+            return Some(target);
+        }
+    }
+    None
 }
 
 /// Whether a segment range is nested inside another extracted segment (the
@@ -28152,25 +29462,44 @@ fn evaluate_core_filesystem_pack(
     inherited_automated_stdin: bool,
     heredoc_settings: Option<&crate::config::HeredocSettings>,
 ) -> Option<EvaluationResult> {
+    // The quoted and escaped `;`, `|`, `&` of this command, in its own
+    // coordinates, for the add-only masked pass every destructive pass below
+    // gets (see `evaluate_view_then_separator_masked`). Only POSIX grammar
+    // has a quoting rule to apply, and it is also the only grammar these
+    // segment ranges come from.
+    let masked_separator_offsets =
+        if matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            crate::packs::quoted_shell_separator_offsets(command_for_packs)
+        } else {
+            Vec::new()
+        };
+
     // These rules intentionally span shell separators (the propagation
     // chains and the fork bomb). Evaluate them once against the complete
     // command before any safe per-invocation rm decision can hide them.
     if segment_ranges.len() > 1 {
-        if let Some(result) = evaluate_pack_destructive_patterns(
-            pack_id,
-            pack,
+        if let Some(result) = evaluate_view_then_separator_masked(
             command_for_packs,
-            shell_dialect,
             0,
-            original_command,
-            normalized_offset,
-            original_len,
-            allowlists,
-            project_path,
-            first_allowlist_hit,
-            deadline,
-            &[],
-            Some(filesystem_cross_segment_pattern),
+            &masked_separator_offsets,
+            |view| {
+                evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    view,
+                    shell_dialect,
+                    0,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut *first_allowlist_hit,
+                    deadline,
+                    &[],
+                    Some(filesystem_cross_segment_pattern),
+                )
+            },
         ) {
             return Some(result);
         }
@@ -28203,6 +29532,7 @@ fn evaluate_core_filesystem_pack(
         Cow::Borrowed(command_for_packs)
     };
     let dialect_source = dialect_source.as_ref();
+    let rm_stdin_context = crate::packs::core::filesystem::RmStdinContext::new(command_for_packs);
 
     for &(segment_start, segment_end) in segment_ranges {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
@@ -28443,21 +29773,28 @@ fn evaluate_core_filesystem_pack(
         // quoted-span guard below can distinguish `psql -c
         // 'SELECT a>/etc/x'` from a real redirect (issue #225).
         if shell_dialect == ShellDialect::Unknown && segment_for_match.contains('>') {
-            if let Some(result) = evaluate_pack_destructive_patterns(
-                pack_id,
-                pack,
+            if let Some(result) = evaluate_view_then_separator_masked(
                 segment_for_match,
-                shell_dialect,
                 segment_start,
-                original_command,
-                normalized_offset,
-                original_len,
-                allowlists,
-                project_path,
-                first_allowlist_hit,
-                deadline,
-                &nested_segment_ranges,
-                Some(redirect_filter),
+                &masked_separator_offsets,
+                |view| {
+                    evaluate_pack_destructive_patterns(
+                        pack_id,
+                        pack,
+                        view,
+                        shell_dialect,
+                        segment_start,
+                        original_command,
+                        normalized_offset,
+                        original_len,
+                        allowlists,
+                        project_path,
+                        &mut *first_allowlist_hit,
+                        deadline,
+                        &nested_segment_ranges,
+                        Some(redirect_filter),
+                    )
+                },
             ) {
                 return Some(result);
             }
@@ -28468,32 +29805,35 @@ fn evaluate_core_filesystem_pack(
         } else if first_unquoted_output_redirect(dialect_segment, shell_dialect).is_some() {
             let redirect_view =
                 filesystem_redirection_matching_view(dialect_segment, shell_dialect);
-            if let Some(result) = evaluate_pack_destructive_patterns(
-                pack_id,
-                pack,
+            if let Some(result) = evaluate_view_then_separator_masked(
                 redirect_view.as_ref(),
-                shell_dialect,
                 segment_start,
-                original_command,
-                normalized_offset,
-                original_len,
-                allowlists,
-                project_path,
-                first_allowlist_hit,
-                deadline,
-                &nested_segment_ranges,
-                Some(redirect_filter),
+                &masked_separator_offsets,
+                |view| {
+                    evaluate_pack_destructive_patterns(
+                        pack_id,
+                        pack,
+                        view,
+                        shell_dialect,
+                        segment_start,
+                        original_command,
+                        normalized_offset,
+                        original_len,
+                        allowlists,
+                        project_path,
+                        &mut *first_allowlist_hit,
+                        deadline,
+                        &nested_segment_ranges,
+                        Some(redirect_filter),
+                    )
+                },
             ) {
                 return Some(result);
             }
         }
 
         let rm_automated_stdin = inherited_automated_stdin
-            || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
-                command_for_packs,
-                segment_start,
-                shell_dialect,
-            );
+            || rm_stdin_context.segment_receives_automated_stdin(segment_start, shell_dialect);
         let mut rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
             dialect_segment,
             rm_automated_stdin,
@@ -28615,21 +29955,28 @@ fn evaluate_core_filesystem_pack(
             // data, not another filesystem command. Redirect syntax was
             // handled independently above; nested executable constructs have
             // their own ranges and are evaluated independently.
-        } else if let Some(result) = evaluate_pack_destructive_patterns(
-            pack_id,
-            pack,
+        } else if let Some(result) = evaluate_view_then_separator_masked(
             segment_for_match,
-            shell_dialect,
             segment_start,
-            original_command,
-            normalized_offset,
-            original_len,
-            allowlists,
-            project_path,
-            first_allowlist_hit,
-            deadline,
-            &nested_segment_ranges,
-            Some(pre_rm_filter),
+            &masked_separator_offsets,
+            |view| {
+                evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    view,
+                    shell_dialect,
+                    segment_start,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut *first_allowlist_hit,
+                    deadline,
+                    &nested_segment_ranges,
+                    Some(pre_rm_filter),
+                )
+            },
         ) {
             return Some(result);
         }
@@ -28748,27 +30095,94 @@ fn evaluate_core_filesystem_pack(
             filesystem_non_pre_rm_non_redirect_pattern
         };
 
-        if let Some(result) = evaluate_pack_destructive_patterns(
-            pack_id,
-            pack,
+        if let Some(result) = evaluate_view_then_separator_masked(
             segment_for_match,
-            shell_dialect,
             segment_start,
-            original_command,
-            normalized_offset,
-            original_len,
-            allowlists,
-            project_path,
-            first_allowlist_hit,
-            deadline,
-            &nested_segment_ranges,
-            Some(final_filter),
+            &masked_separator_offsets,
+            |view| {
+                evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    view,
+                    shell_dialect,
+                    segment_start,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut *first_allowlist_hit,
+                    deadline,
+                    &nested_segment_ranges,
+                    Some(final_filter),
+                )
+            },
         ) {
             return Some(result);
         }
     }
 
     None
+}
+
+/// `view`, a byte-aligned slice of a pack's command that starts at
+/// `view_offset`, with the quoted and escaped separators at `offsets` (from
+/// [`crate::packs::quoted_shell_separator_offsets`] over that command)
+/// replaced by [`crate::packs::MASKED_SHELL_SEPARATOR`]. `None` when no such
+/// separator survives in the view. Only a byte that is still `;`, `|` or `&`
+/// in `view` is replaced, so a view that already blanked it (sanitized
+/// argument data, the redirect-only view) gets no new text.
+fn mask_separator_offsets_in_view(
+    view: &str,
+    view_offset: usize,
+    offsets: &[usize],
+) -> Option<String> {
+    let view_end = view_offset.checked_add(view.len())?;
+    let first = offsets.partition_point(|&offset| offset < view_offset);
+    let mut masked: Option<Vec<u8>> = None;
+    for &offset in offsets[first..]
+        .iter()
+        .take_while(|&&offset| offset < view_end)
+    {
+        let local = offset - view_offset;
+        if matches!(view.as_bytes()[local], b';' | b'|' | b'&') {
+            masked.get_or_insert_with(|| view.as_bytes().to_vec())[local] =
+                crate::packs::MASKED_SHELL_SEPARATOR;
+        }
+    }
+    masked.map(|bytes| {
+        String::from_utf8(bytes).expect("replacing ASCII bytes with ASCII keeps UTF-8 valid")
+    })
+}
+
+/// Run one `core.filesystem` destructive pass over `view`, and when it decides
+/// nothing, once more over the same view with its quoted and escaped `;`, `|`
+/// and `&` masked (GitHub #552 follow-up).
+///
+/// Rules that must stay inside one command scan with `[^|;&]*`, and that scan
+/// stopped at a separator byte even when the shell reads it as data. So a
+/// quoted separator in an earlier operand hid every later operand: `mv "a;b"
+/// ~/Documents /tmp/x; rm -rf /tmp/x`, `find "a;b" / -delete` and
+/// `rsync -a --delete "a & b" /tmp/src/ /etc/` were all allowed while the same
+/// commands with a quoted space were denied.
+///
+/// The second pass is add-only. The unmasked pass runs first and unchanged, so
+/// a rule that keys on a separator byte (a find `\;` terminator, a propagation
+/// chain's `&&`) keeps every match it had, and the masked view never touches a
+/// real separator, so a scan still cannot leave its command. Spans map 1:1
+/// because the view has the same length. Safe patterns are deliberately not
+/// given this view: they must keep reading only what they were written for.
+fn evaluate_view_then_separator_masked(
+    view: &str,
+    view_offset: usize,
+    masked_separator_offsets: &[usize],
+    mut evaluate: impl FnMut(&str) -> Option<EvaluationResult>,
+) -> Option<EvaluationResult> {
+    if let Some(result) = evaluate(view) {
+        return Some(result);
+    }
+    let masked = mask_separator_offsets_in_view(view, view_offset, masked_separator_offsets)?;
+    evaluate(&masked)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -29138,6 +30552,101 @@ fn range_intersects_conservatively_scanned_interpreter_input(
     })
 }
 
+/// The `core.filesystem` regex rules that read recursive `rm` syntax.
+fn is_core_filesystem_recursive_rm_rule(pack_id: &str, name: Option<&str>) -> bool {
+    pack_id == "core.filesystem"
+        && matches!(
+            name,
+            Some(
+                "rm-rf-root-home"
+                    | "rm-r-f-separate-root-home"
+                    | "rm-recursive-force-root-home"
+                    | "rm-rf-general"
+                    | "rm-r-f-separate"
+                    | "rm-recursive-force-long"
+            )
+        )
+}
+
+/// Whether a recursive-`rm` regex hit lies inside a verified literal shell
+/// script that is, as a whole, one literal cleanup of `/tmp` or `/var/tmp`
+/// descendants (#576).
+///
+/// The outer command's view still contains the script's bytes, so
+/// `sh -c 'rm -rf /tmp/probe'` matched `rm-rf-root-home` on `rm -rf /`: the
+/// core rm parser, which grants the literal-temp exemption, only ever sees
+/// `sh` as this segment's executable. The script itself is evaluated again as
+/// its own top-level text, where that exemption applies, and the hit here is
+/// the same text read without it. Stand the outer hit down only when:
+///
+/// * the script's bytes reach its shell unchanged (`literal_bash_source_range`:
+///   a single-quoted `-c` script of a literal POSIX shell owning the command,
+///   a quoted heredoc body, or a direct ssh payload), so no outer expansion,
+///   wrapper, function or trailing argv can rewrite it; and
+/// * the WHOLE script passes the same proof the `heredoc.bash` rm refinement
+///   uses (bb3a7d1): one literal `rm` argv with only recursive/force flags,
+///   every operand a real temp descendant without traversal, and the core
+///   parser's independent Allow.
+///
+/// Roots, traversal, other operands, expansions, globs, separators, redirects,
+/// interactive flags and every other rule keep the outer denial.
+fn recursive_rm_match_is_literal_temp_inline_script(
+    pack_id: &str,
+    pattern_name: Option<&str>,
+    command: &str,
+    span: MatchSpan,
+    source_context: Option<(&str, usize)>,
+) -> bool {
+    if !is_core_filesystem_recursive_rm_rule(pack_id, pattern_name) {
+        return false;
+    }
+    let Some((source, source_base)) = source_context else {
+        return false;
+    };
+    // The regex may include the boundary byte before `rm` (the script's
+    // opening quote), so attribute the hit from the command word itself.
+    let Some(keyword) = command
+        .get(span.start..span.end)
+        .and_then(|matched| {
+            matched
+                .bytes()
+                .position(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .map(|offset| span.start.saturating_add(offset))
+    else {
+        return false;
+    };
+    let (Some(start), Some(end)) = (
+        source_base.checked_add(keyword),
+        source_base.checked_add(span.end),
+    ) else {
+        return false;
+    };
+    // The matching views are length preserving; any other mapping is refused.
+    if source
+        .get(start..end)
+        .is_none_or(|mapped| command.get(keyword..span.end) != Some(mapped))
+    {
+        return false;
+    }
+    if crate::heredoc::check_triggers(source) == crate::heredoc::TriggerResult::NoTrigger {
+        return false;
+    }
+    // Structural budget (#443): a timeout keeps the deny.
+    let ExtractionResult::Extracted(contents) =
+        extract_content(source, &crate::heredoc::ExtractionLimits::structural_scan())
+    else {
+        return false;
+    };
+    contents.iter().any(|content| {
+        literal_bash_source_range(source, content).is_some_and(|range| {
+            range.start <= start
+                && end <= range.end
+                && crate::ast_matcher::literal_temp_rm(&content.content)
+        })
+    })
+}
+
 fn find_actionable_command_pattern_span(
     pack_id: &str,
     pattern_name: Option<&str>,
@@ -29172,6 +30681,12 @@ fn find_actionable_command_pattern_span(
             continue;
         }
         if !command_pattern_match_is_inert_quoted_data(
+            pack_id,
+            pattern_name,
+            command,
+            span,
+            source_context,
+        ) && !recursive_rm_match_is_literal_temp_inline_script(
             pack_id,
             pattern_name,
             command,
@@ -29439,18 +30954,189 @@ fn segment_executable_name(segment: &str) -> Option<String> {
 /// allowed at 97, and its unscoped twin denied at both. Answering "yes" there
 /// makes a scoped rule at least as strict as the unscoped rule it refines,
 /// which is the only defensible direction for a guard.
+///
+/// A launcher that runs its operand as a program (`find … -exec X`, `xargs X`,
+/// `flock LOCK X`, `doas X`, `parallel X`) also invokes `X`. The resolved argv0
+/// is the launcher, so without this a scoped rule never fired behind one: the
+/// unscoped `unlink` rules used to deny `find . -exec unlink {} \;` and
+/// `flock /tmp/l unlink /etc/passwd`, and scoping them (#550) allowed both.
+/// This applies to every `executables`-scoped rule, not only unlink's: a
+/// scoped chmod rule judges `find / -exec chmod …` as the chmod it runs.
 fn segment_invokes_executable_in_dialect(
     segment: &str,
     executables: &[&str],
     dialect: ShellDialect,
 ) -> bool {
-    match segment_executable_in_dialect(segment, dialect) {
-        SegmentExecutable::Name(argv0) => executables
+    let declared = |name: &str| {
+        executables
             .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(&argv0)),
+            .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    };
+    match segment_executable_in_dialect(segment, dialect) {
+        SegmentExecutable::Name(argv0) => {
+            declared(&argv0)
+                || operand_launched_executables(segment, &argv0)
+                    .iter()
+                    .any(|launched| declared(launched))
+        }
         SegmentExecutable::WrapperChainTruncated => true,
         SegmentExecutable::Unresolvable => false,
     }
+}
+
+/// Basenames of the programs a launcher argv0 runs from its own operands.
+///
+/// Read from whitespace-separated words, so a quoted operand containing
+/// spaces can only make this see an extra program, which only widens a scope.
+/// Option values the launchers take as separate words are skipped so they are
+/// not mistaken for the program (`xargs -I {} X`, `flock -w 5 LOCK X`).
+///
+/// Launchers whose option grammar is not modeled here (`watch`, `strace`,
+/// `pkexec`, `chroot DIR`, ...) expose every operand word that is not an
+/// option. That may admit a word that is really an option value, which only
+/// widens the scope; reading one word too few would hide the program.
+fn operand_launched_executables(segment: &str, argv0: &str) -> Vec<String> {
+    let modeled = matches!(argv0, "find" | "xargs" | "flock" | "doas" | "parallel");
+    let unmodeled = matches!(
+        argv0,
+        "watch"
+            | "strace"
+            | "ltrace"
+            | "pkexec"
+            | "run0"
+            | "chroot"
+            | "unshare"
+            | "nsenter"
+            | "setpriv"
+            | "taskset"
+            | "numactl"
+            | "firejail"
+            | "systemd-run"
+            | "fakeroot"
+            | "unbuffer"
+            | "chronic"
+            | "caffeinate"
+            | "gtimeout"
+            | "torsocks"
+            | "proxychains"
+            | "proxychains4"
+            | "valgrind"
+    );
+    if !modeled && !unmodeled {
+        return Vec::new();
+    }
+    let basename = |word: &str| -> Option<String> {
+        let unquoted: String = word
+            .chars()
+            .filter(|ch| !matches!(ch, '\'' | '"' | '\\'))
+            .collect();
+        let name = unquoted
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        (!name.is_empty()).then_some(name)
+    };
+    let words: Vec<&str> = segment.split_ascii_whitespace().collect();
+    let Some(start) = words
+        .iter()
+        .position(|word| basename(word).as_deref() == Some(argv0))
+    else {
+        return Vec::new();
+    };
+    let operands = &words[start + 1..];
+    if unmodeled {
+        return operands
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .filter_map(|word| basename(word))
+            .collect();
+    }
+    if argv0 == "find" {
+        return operands
+            .windows(2)
+            .filter(|pair| matches!(pair[0], "-exec" | "-execdir" | "-ok" | "-okdir"))
+            .filter_map(|pair| basename(pair[1]))
+            .collect();
+    }
+    // Options whose value is a separate word, per launcher.
+    let takes_value: &[&str] = match argv0 {
+        // GNU `-e[EOF]`, `-i[R]` and `-l[N]` take only an attached value.
+        "xargs" => &[
+            "-a",
+            "-d",
+            "-E",
+            "-I",
+            "-L",
+            "-n",
+            "-P",
+            "-s",
+            "--arg-file",
+            "--delimiter",
+            "--eof",
+            "--max-lines",
+            "--max-args",
+            "--max-procs",
+            "--max-chars",
+            "--process-slot-var",
+        ],
+        "flock" => &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
+        "doas" => &["-a", "-C", "-u"],
+        // parallel: the common value-taking options.
+        _ => &[
+            "-a",
+            "-j",
+            "-P",
+            "-S",
+            "-n",
+            "-N",
+            "-L",
+            "-s",
+            "-d",
+            "-E",
+            "-I",
+            "-C",
+            "--jobs",
+            "--sshlogin",
+            "--arg-file",
+            "--delay",
+            "--timeout",
+            "--colsep",
+        ],
+    };
+    let mut index = 0;
+    // flock's first operand is the lock file or descriptor, not the program.
+    let mut lock_pending = argv0 == "flock";
+    while let Some(word) = operands.get(index) {
+        index += 1;
+        if word.starts_with('-') && word.len() > 1 {
+            // `flock LOCK -c 'cmd'` hands the command to a shell, which the
+            // embedded-script analysis already reads.
+            if argv0 == "flock" && matches!(*word, "-c" | "--command") {
+                return Vec::new();
+            }
+            if takes_value.contains(word) {
+                index += 1;
+            }
+            continue;
+        }
+        if lock_pending {
+            lock_pending = false;
+            continue;
+        }
+        // GNU parallel with no command runs each input as a command line:
+        // `parallel ::: 'unlink /etc/passwd'`. Every input word may then be a
+        // program, so expose them all; this can only widen the scope.
+        if argv0 == "parallel" && word.starts_with(":::") {
+            return operands[index..]
+                .iter()
+                .filter(|input| !input.starts_with(":::"))
+                .filter_map(|input| basename(input))
+                .collect();
+        }
+        return basename(word).into_iter().collect();
+    }
+    Vec::new()
 }
 
 fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
@@ -29737,6 +31423,17 @@ fn evaluate_pack_destructive_patterns(
     } else {
         pattern_command
     };
+    let unlink_command = (pack_id == "core.filesystem"
+        && pattern_filter.is_none_or(|include| {
+            include(Some("unlink-root-home")) || include(Some("unlink-general"))
+        }))
+    .then(|| {
+        crate::packs::core::filesystem::unlink_command_for_pattern_matching(
+            command_slice,
+            shell_dialect,
+        )
+    })
+    .flatten();
 
     // Executable-scoped rules (issue #289). Resolve each top-level segment of
     // this slice once, in the same coordinate space as `matched_span`
@@ -29783,27 +31480,42 @@ fn evaluate_pack_destructive_patterns(
         if semantic_branch_rule.is_some() && !semantic_branch_match {
             continue;
         }
+        // The source spelling of argv0 is not its executable value (#550).
+        // This proof decodes only a literal unlink command word and keeps its
+        // arguments intact; other filesystem rules still see their ordinary
+        // sanitized source. It also owns unlink's literal temp/help exceptions.
+        let semantic_unlink_match = if crate::packs::core::filesystem::is_unlink_rule(pattern.name)
+            && let Some(command) = &unlink_command
+        {
+            if command.safe || !pattern.regex.is_match(&command.matching_view) {
+                continue;
+            }
+            true
+        } else {
+            false
+        };
 
         // Parser-only matches (for example a unique long-option abbreviation)
         // deliberately carry no source span. A broad regex span can point at
         // option data such as an earlier `--format -d`, which is worse than no
         // span and would mislead explain/audit output.
-        let matched_span = if semantic_branch_match || transformed_without_source_map {
-            None
-        } else {
-            find_actionable_command_pattern_span(
-                pack_id,
-                pattern.name,
-                &pattern.regex,
-                pattern_command,
-                normalized_offset
-                    .map(|offset| (original_command, offset.saturating_add(slice_offset))),
-            )
-            .map(|span| MatchSpan {
-                start: span.start + slice_offset,
-                end: span.end + slice_offset,
-            })
-        };
+        let matched_span =
+            if semantic_branch_match || semantic_unlink_match || transformed_without_source_map {
+                None
+            } else {
+                find_actionable_command_pattern_span(
+                    pack_id,
+                    pattern.name,
+                    &pattern.regex,
+                    pattern_command,
+                    normalized_offset
+                        .map(|offset| (original_command, offset.saturating_add(slice_offset))),
+                )
+                .map(|span| MatchSpan {
+                    start: span.start + slice_offset,
+                    end: span.end + slice_offset,
+                })
+            };
 
         if deadline_exceeded(deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
@@ -29811,7 +31523,11 @@ fn evaluate_pack_destructive_patterns(
 
         let decoded_regex_match =
             transformed_without_source_map && pattern.regex.is_match(pattern_command);
-        if !semantic_branch_match && !decoded_regex_match && matched_span.is_none() {
+        if !semantic_branch_match
+            && !semantic_unlink_match
+            && !decoded_regex_match
+            && matched_span.is_none()
+        {
             continue;
         }
 
@@ -29831,7 +31547,9 @@ fn evaluate_pack_destructive_patterns(
         // rules) instead requires *some* segment of this slice to be run by a
         // declared executable — the coarsest sound reading, since there is no
         // position to attribute. A dynamic argv0 never satisfies the rule.
-        if let Some(executables) = pattern.executables {
+        if let Some(executables) = pattern.executables
+            && !semantic_unlink_match
+        {
             let segments = executable_segments.as_deref().unwrap_or(&[]);
             let governed = match matched_span.as_ref() {
                 Some(span) => span_is_inside_executable_segment(
@@ -30112,6 +31830,11 @@ where
     S: LegacySafePattern,
     D: LegacyDestructivePattern,
 {
+    // Required trusted policy must be intact before any authorization path (#568).
+    if let Some(reason) = compiled_overrides.configuration_error.as_deref() {
+        return EvaluationResult::denied_by_config(reason.to_string());
+    }
+
     // Empty commands are allowed (no-op)
     if command.is_empty() {
         return EvaluationResult::allowed();
@@ -30622,8 +32345,25 @@ fn evaluate_heredoc(
         }
     };
 
+    // Here-strings historically received the complete Bash analysis, including
+    // its independent AST rules and language/content exemptions. Recognizing
+    // their receiving interpreter adds a second reading; replacing the Bash
+    // reading would let a core-rule allowlist also bypass a distinct
+    // `heredoc.bash` rule, including when the receiver is rebound to a shell.
+    // Each source has at most two bounded views, and both retain the existing
+    // deadline, retry, fallback and allowlist handling below.
+    let content_views = contents.into_iter().flat_map(|content| {
+        let shell_view = (content.heredoc_type == Some(crate::heredoc::HeredocType::HereString)
+            && content.language != crate::heredoc::ScriptLanguage::Bash)
+            .then(|| {
+                let mut shell_view = content.clone();
+                shell_view.language = crate::heredoc::ScriptLanguage::Bash;
+                shell_view
+            });
+        shell_view.into_iter().chain(std::iter::once(content))
+    });
     let mut ast_left_body_unanalysed = false;
-    for mut content in contents {
+    for mut content in content_views {
         if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }
@@ -30699,6 +32439,7 @@ fn evaluate_heredoc(
                         effective_mode: Some(crate::packs::DecisionMode::Deny),
                         skipped_due_to_budget: false,
                         quick_rejected: false,
+                        regex_evaluation_incomplete: false,
                         branch_context: None,
                         session_occurrence: None,
                         graduated_response: None,
@@ -30715,6 +32456,7 @@ fn evaluate_heredoc(
         // Tier 2.5: Recursive Shell Analysis
         // If content is Bash, extract inner commands and feed them back to the full evaluator.
         // This ensures that `kubectl`, `docker`, etc. inside heredocs are checked against their packs.
+        // Here-strings retain this pass in their separate Bash view above.
         if content.language == crate::heredoc::ScriptLanguage::Bash {
             // An awk program printing a computed value into a shell that runs
             // its stdin (`print "rm " $1 | "sh"`) is the shell-level
@@ -30738,11 +32480,12 @@ fn evaluate_heredoc(
             }
             // An inline `-c` script that is nothing but one expansion or
             // command substitution (`bash -c "$X"`, `sh -c "$(wget -qO- …)"`)
-            // runs source dcg never sees. The keyword pre-filter below skipped
-            // it — `$X` carries no pack keyword — so `x='rm -rf ~'; bash -c "$x"`
-            // was allowed while `eval "$x"` (heredoc.posix:eval-dynamic) and
-            // `curl … | sh` (pipeline-consumer) are denied. Partly dynamic
-            // scripts (`bash -c "cd $HOME/p && make"`) are still analysed.
+            // runs source dcg never sees. Its text cannot help: `$X` carries no
+            // pack keyword, and read whole (below) it is an unknown program, so
+            // `x='rm -rf ~'; bash -c "$x"` was allowed while `eval "$x"`
+            // (heredoc.posix:eval-dynamic) and `curl … | sh`
+            // (pipeline-consumer) are denied. Partly dynamic scripts
+            // (`bash -c "cd $HOME/p && make"`) are still analysed.
             if content.heredoc_type.is_none()
                 && inline_shell_script_is_wholly_dynamic(&content.content)
             {
@@ -30764,173 +32507,211 @@ fn evaluate_heredoc(
                         content.byte_range.start,
                         context.shell_dialect,
                     ));
-            // Fast pre-filter: skip the expensive tree-sitter AST parse if the
-            // heredoc body contains none of the enabled pack keywords. The AC
-            // automaton does a single O(n) scan; the AST parse is much heavier.
-            let body_has_keywords = context.keyword_index.map_or_else(
-                || {
-                    context.enabled_keywords.iter().any(|kw| {
-                        memchr::memmem::find(content.content.as_bytes(), kw.as_bytes()).is_some()
-                    })
-                },
-                |index| index.has_any_keyword(&content.content),
-            );
+            // The per-command pass sends every simple command of the body,
+            // including those inside loops, functions and substitutions,
+            // through the evaluator on its own. Pack keywords alone cannot
+            // gate it: a shell body may launch an embedded Python/JavaScript
+            // script whose destructive operations have no enabled shell-pack
+            // keyword. Preserve nested interpreter and heredoc triggers as
+            // independent reasons to run it.
+            // A keyword-less pack promises to inspect every executable
+            // command. The outer quick-reject already honors that contract;
+            // shell payload recursion must not silently discard it here.
+            let body_has_keywords = context.enabled_keywords.is_empty()
+                || crate::packs::get_external_packs()
+                    .is_some_and(crate::packs::ExternalPackStore::has_keywordless_pack)
+                || context.keyword_index.map_or_else(
+                    || {
+                        context.enabled_keywords.iter().any(|kw| {
+                            memchr::memmem::find(content.content.as_bytes(), kw.as_bytes())
+                                .is_some()
+                        })
+                    },
+                    |index| index.has_any_keyword(&content.content),
+                );
+            let per_command_pass =
+                body_has_keywords || check_triggers(&content.content) == TriggerResult::Triggered;
 
-            if body_has_keywords {
-                // A payload arriving on `psql`'s stdin is PostgreSQL, and the
-                // denial should say so (#428). The two SQL packs carry a
-                // byte-identical `truncate-table`, so with both enabled
-                // `psql db <<SQL … TRUNCATE users; … SQL` was denied as
-                // `database.mysql:truncate-table` — the right decision under
-                // the wrong rule id, and rule ids are the stable allowlist
-                // key, so a user who allowlists what the denial names gets a
-                // surprise. The carrier's own pack is moved to the front of
-                // the order rather than the siblings being dropped: first
-                // match wins, so this fixes the attribution, and no pack loses
-                // its chance to deny something its sibling does not cover.
-                let carrier_first_packs = content
-                    .target_command
-                    .as_deref()
-                    .and_then(database_pack_for_client)
-                    .filter(|owner| context.ordered_packs.iter().any(|id| id == owner))
-                    .map(|owner| {
-                        let mut ids = Vec::with_capacity(context.ordered_packs.len());
-                        ids.push(owner.to_string());
-                        ids.extend(
-                            context
-                                .ordered_packs
-                                .iter()
-                                .filter(|id| id.as_str() != owner)
-                                .cloned(),
-                        );
-                        ids
-                    });
-                let inner_ordered_packs = carrier_first_packs
-                    .as_deref()
-                    .unwrap_or(context.ordered_packs);
-                let contextual_redirects = if literal_bash_source_range(command, &content).is_some()
-                {
+            // A payload arriving on `psql`'s stdin is PostgreSQL, and the
+            // denial should say so (#428). The two SQL packs carry a
+            // byte-identical `truncate-table`, so with both enabled
+            // `psql db <<SQL … TRUNCATE users; … SQL` was denied as
+            // `database.mysql:truncate-table` — the right decision under
+            // the wrong rule id, and rule ids are the stable allowlist
+            // key, so a user who allowlists what the denial names gets a
+            // surprise. The carrier's own pack is moved to the front of
+            // the order rather than the siblings being dropped: first
+            // match wins, so this fixes the attribution, and no pack loses
+            // its chance to deny something its sibling does not cover.
+            let carrier_first_packs = content
+                .target_command
+                .as_deref()
+                .and_then(database_pack_for_client)
+                .filter(|owner| context.ordered_packs.iter().any(|id| id == owner))
+                .map(|owner| {
+                    let mut ids = Vec::with_capacity(context.ordered_packs.len());
+                    ids.push(owner.to_string());
+                    ids.extend(
+                        context
+                            .ordered_packs
+                            .iter()
+                            .filter(|id| id.as_str() != owner)
+                            .cloned(),
+                    );
+                    ids
+                });
+            let inner_ordered_packs = carrier_first_packs
+                .as_deref()
+                .unwrap_or(context.ordered_packs);
+            let contextual_redirects =
+                if per_command_pass && literal_bash_source_range(command, &content).is_some() {
                     proven_bash_redirect_offsets(&content.content)
                 } else {
                     Vec::new()
                 };
-                let evaluate_source = |source: &str| {
-                    evaluate_command_with_pack_order_deadline_at_path_inner(
-                        source,
-                        context.enabled_keywords,
-                        inner_ordered_packs,
-                        context.keyword_index,
-                        context.compiled_overrides,
-                        context.allowlists,
-                        context.heredoc_settings,
-                        context.allow_once_audit,
-                        context.project_path,
-                        context.deadline,
-                        crate::normalize::ShellDialect::Posix,
-                        context.nested_command_depth + 1,
-                        inline_automated_stdin,
-                    )
+            let evaluate_source = |source: &str| {
+                evaluate_command_with_pack_order_deadline_at_path_inner(
+                    source,
+                    context.enabled_keywords,
+                    inner_ordered_packs,
+                    context.keyword_index,
+                    context.compiled_overrides,
+                    context.allowlists,
+                    context.heredoc_settings,
+                    context.allow_once_audit,
+                    context.project_path,
+                    context.deadline,
+                    crate::normalize::ShellDialect::Posix,
+                    context.nested_command_depth + 1,
+                    inline_automated_stdin,
+                )
+            };
+            let mut complete_source_result = None;
+            let inner_commands = if per_command_pass {
+                crate::heredoc::extract_shell_commands(&content.content)
+            } else {
+                // Without a keyword or trigger the per-command pass has
+                // nothing to look for, but the body is still a script the
+                // shell runs, and a missing keyword is no proof that it is
+                // safe. The evaluator's own quick reject forces analysis of
+                // keyword-less shapes (a dynamic executable before a delete
+                // flag, `$G -D main`, is `core.git:branch-dynamic-token`), and
+                // its earlier passes read alias and trap bodies and resolve
+                // assigned executables. Skipping recursion here allowed
+                // `bash -c '$G -D main'` and `ssh h '$p -d 1'` while their
+                // text is denied at top level, and an unrelated `ln` (or
+                // `xlnx`, a substring) anywhere in the script turned the
+                // denial back on (#551). Such a body is evaluated once, whole,
+                // exactly as its text is at top level. That evaluation's own
+                // quick reject still decides: a benign body costs one
+                // quick-reject pass, and past it only the packs the same text
+                // selects at top level are evaluated (`core.git`, forced by a
+                // live expansion), never the full pack list.
+                vec![crate::heredoc::ExtractedShellCommand {
+                    text: content.content.clone(),
+                    start: 0,
+                    end: content.content.len(),
+                    line_number: 1,
+                }]
+            };
+            for inner in inner_commands {
+                if deadline_exceeded(context.deadline) {
+                    return Some(EvaluationResult::indeterminate_due_to_budget());
+                }
+
+                // A leaf such as `echo > "/tmp/run-$i"` loses the `for`
+                // header or assignment that proves its target (#526).
+                // Evaluate its complete, literal Bash body when that
+                // exact operator has a scoped proof. This keeps every
+                // other rule and command in the evaluator; it is not a
+                // blanket exemption for the extracted leaf. The single
+                // whole-body command of a body without a per-command pass
+                // takes the same route, so a denial in it is mapped and
+                // line-numbered from its span.
+                let needs_source_context = !per_command_pass
+                    || first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
+                        .is_some_and(|operator| {
+                            contextual_redirects.contains(&(inner.start + operator))
+                        });
+                let result = if needs_source_context {
+                    complete_source_result
+                        .get_or_insert_with(|| evaluate_source(&content.content))
+                        .clone()
+                } else {
+                    evaluate_source(&inner.text)
                 };
-                let mut complete_source_result = None;
-                let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
-                for inner in inner_commands {
-                    if deadline_exceeded(context.deadline) {
-                        return Some(EvaluationResult::indeterminate_due_to_budget());
-                    }
+                let (evaluated_start, evaluated_end) = if needs_source_context {
+                    (0, content.content.len())
+                } else {
+                    (inner.start, inner.end)
+                };
 
-                    // A leaf such as `echo > "/tmp/run-$i"` loses the `for`
-                    // header or assignment that proves its target (#526).
-                    // Evaluate its complete, literal Bash body when that
-                    // exact operator has a scoped proof. This keeps every
-                    // other rule and command in the evaluator; it is not a
-                    // blanket exemption for the extracted leaf.
-                    let needs_source_context =
-                        first_unquoted_output_redirect(&inner.text, ShellDialect::Posix)
-                            .is_some_and(|operator| {
-                                contextual_redirects.contains(&(inner.start + operator))
-                            });
-                    let result = if needs_source_context {
-                        complete_source_result
-                            .get_or_insert_with(|| evaluate_source(&content.content))
-                            .clone()
-                    } else {
-                        evaluate_source(&inner.text)
-                    };
-                    let (evaluated_start, evaluated_end) = if needs_source_context {
-                        (0, content.content.len())
-                    } else {
-                        (inner.start, inner.end)
-                    };
+                // A nested evaluator may conservatively stop before the
+                // absolute deadline when the remaining budget is too
+                // small for its next stage. Propagate that result exactly;
+                // checking the clock again here can still be false and
+                // must never turn incomplete nested analysis into Allow.
+                if nested_evaluation_incomplete(&result) {
+                    return Some(EvaluationResult::indeterminate_due_to_budget());
+                }
 
-                    // A nested evaluator may conservatively stop before the
-                    // absolute deadline when the remaining budget is too
-                    // small for its next stage. Propagate that result exactly;
-                    // checking the clock again here can still be false and
-                    // must never turn incomplete nested analysis into Allow.
-                    if nested_evaluation_incomplete(&result) {
-                        return Some(EvaluationResult::indeterminate_due_to_budget());
-                    }
-
-                    if result.is_denied() {
-                        // Propagate denial, wrapping the reason context
-                        if let Some(mut info) = result.pattern_info {
-                            let line_number = if needs_source_context {
-                                info.matched_span
-                                    .as_ref()
-                                    .and_then(|span| content.content.get(..span.start))
-                                    .map_or(1, |prefix| {
-                                        prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
-                                    })
-                            } else {
-                                inner.line_number
-                            };
-                            info.reason = wrap_embedded_shell_denial_reason(
-                                &info.reason,
-                                content.heredoc_type.is_some(),
-                                content.target_command.as_deref(),
-                                line_number,
-                            );
-                            info.source = MatchSource::HeredocAst; // Mark as heredoc source
-                            if let Some(span) = info.matched_span {
-                                if let Some(mapped_inner) = map_heredoc_span(
-                                    command,
-                                    &content,
-                                    evaluated_start,
-                                    evaluated_end,
-                                ) {
-                                    let mapped = MatchSpan {
-                                        start: mapped_inner.start.saturating_add(span.start),
-                                        end: mapped_inner.start.saturating_add(span.end),
-                                    };
-                                    if mapped.end <= command.len() {
-                                        info.matched_span = Some(mapped);
-                                        info.matched_text_preview =
-                                            Some(extract_match_preview(command, &mapped));
-                                    } else {
-                                        info.matched_span = None;
-                                    }
+                if result.is_denied() {
+                    // Propagate denial, wrapping the reason context
+                    if let Some(mut info) = result.pattern_info {
+                        let line_number = if needs_source_context {
+                            info.matched_span
+                                .as_ref()
+                                .and_then(|span| content.content.get(..span.start))
+                                .map_or(1, |prefix| {
+                                    prefix.bytes().filter(|byte| *byte == b'\n').count() + 1
+                                })
+                        } else {
+                            inner.line_number
+                        };
+                        info.reason = wrap_embedded_shell_denial_reason(
+                            &info.reason,
+                            content.heredoc_type.is_some(),
+                            content.target_command.as_deref(),
+                            line_number,
+                        );
+                        info.source = MatchSource::HeredocAst; // Mark as heredoc source
+                        if let Some(span) = info.matched_span {
+                            if let Some(mapped_inner) =
+                                map_heredoc_span(command, &content, evaluated_start, evaluated_end)
+                            {
+                                let mapped = MatchSpan {
+                                    start: mapped_inner.start.saturating_add(span.start),
+                                    end: mapped_inner.start.saturating_add(span.end),
+                                };
+                                if mapped.end <= command.len() {
+                                    info.matched_span = Some(mapped);
+                                    info.matched_text_preview =
+                                        Some(extract_match_preview(command, &mapped));
                                 } else {
                                     info.matched_span = None;
                                 }
+                            } else {
+                                info.matched_span = None;
                             }
-
-                            return Some(EvaluationResult {
-                                decision: EvaluationDecision::Deny,
-                                pattern_info: Some(info),
-                                allowlist_override: None,
-                                effective_mode: Some(crate::packs::DecisionMode::Deny),
-                                skipped_due_to_budget: false,
-                                quick_rejected: false,
-                                branch_context: None,
-                                session_occurrence: None,
-                                graduated_response: None,
-                                bypass_method: None,
-                            });
                         }
-                        return Some(result);
+
+                        return Some(EvaluationResult {
+                            decision: EvaluationDecision::Deny,
+                            pattern_info: Some(info),
+                            allowlist_override: None,
+                            effective_mode: Some(crate::packs::DecisionMode::Deny),
+                            skipped_due_to_budget: false,
+                            quick_rejected: false,
+                            regex_evaluation_incomplete: false,
+                            branch_context: None,
+                            session_occurrence: None,
+                            graduated_response: None,
+                            bypass_method: None,
+                        });
                     }
+                    return Some(result);
                 }
-            } // body_has_keywords
+            }
         }
 
         let matches = match DEFAULT_MATCHER
@@ -31029,6 +32810,7 @@ fn evaluate_heredoc(
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -31230,6 +33012,7 @@ fn exec_sink_backstop_verdict(
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             quick_rejected: false,
+            regex_evaluation_incomplete: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -31265,29 +33048,34 @@ fn exec_sink_pack_verdict(
         return Some(result);
     }
 
-    // A variable can carry a shell substitution to an indirect or opaque
-    // execution call (#544). The outer shell never expands a quoted heredoc,
-    // and its role-aware Git parser cannot interpret a Python/JS assignment
+    // A variable can carry a shell substitution to an indirect call, or supply
+    // a proven exec/eval dependency (#544). The outer shell never expands a
+    // quoted heredoc, and its role-aware Git parser cannot interpret a Python/JS assignment
     // as a Git invocation. Recover actual host-language literal values for
     // the existing pack evaluator without pretending their quotes are shell
     // syntax. Named calls retain their original ownership in the helper.
-    if !matches!(
-        content.language,
-        crate::heredoc::ScriptLanguage::Python | crate::heredoc::ScriptLanguage::JavaScript
-    ) || (!content.content.contains('`')
-        && !content.content.contains("$(")
-        && !content.content.contains('\\'))
-    {
+    if !crate::ast_matcher::has_interpreter_literal_candidates(&content.content, content.language) {
         return None;
     }
     // The outer Bash parse belongs under the same wall-clock bound as the
     // language parse. Only copy a source small enough to supply this proof.
     let inline = content.heredoc_type.is_none();
+    // An inline program whose word was decoded (`"… \$(…) …"`, `'…'\''…'`)
+    // has no contiguous content span, only the complete word it came from.
+    // Its decoded content is still exactly the program the interpreter runs,
+    // so the same ownership proof applies to that word; skipping it let
+    // every escaped spelling of a #544 recovery through.
+    let decoded_program = match (&content.content_range, &content.word_range) {
+        (None, Some(word)) if inline => Some((word.clone(), content.content.clone())),
+        _ => None,
+    };
     let source_identity = content
         .content_range
-        .as_ref()
+        .clone()
+        .map(|range| (range, None))
+        .or_else(|| decoded_program.map(|(word, program)| (word, Some(program))))
         .filter(|_| command.len() <= crate::heredoc::MAX_SUBSTITUTION_SOURCE_BYTES)
-        .map(|range| (command.to_owned(), range.clone(), content.language));
+        .map(|(range, program)| (command.to_owned(), range, program, content.language));
     let mut budget = crate::ast_matcher::protected_scan_budget();
     if let Some(deadline) = context.deadline {
         let Some(remaining) = deadline.remaining() else {
@@ -31299,18 +33087,23 @@ fn exec_sink_pack_verdict(
         &content.content,
         content.language,
         move || {
-            let Some((source, range, language)) = source_identity else {
+            let Some((source, range, decoded_program, language)) = source_identity else {
                 return (!inline).then_some(false);
             };
-            if inline {
+            if let Some(program) = decoded_program {
+                // The complete word, decoded by the extractor's own lexer.
+                // An unresolved (partial or dynamic) word carries no
+                // `word_range` and never reaches this proof.
+                crate::heredoc::decoded_inline_interpreter_source_proof(
+                    &source, &range, &program, language,
+                )
+            } else if inline {
                 // The existing inline extractor can return a partial raw
                 // fragment when shell quotes are escaped. Only extend it
-                // when the extracted bytes are exactly the complete program;
-                // other forms retain their existing named/raw analysis.
-                crate::heredoc::range_is_literal_inline_interpreter_source(
-                    &source, &range, language,
-                )
-                .then_some(true)
+                // when the extracted bytes are exactly the complete program.
+                // Other consumers revoke the documentation exemption without
+                // suppressing additive checks of that complete source.
+                crate::heredoc::inline_interpreter_source_proof(&source, &range, language)
             } else {
                 Some(crate::heredoc::range_is_quoted_interpreter_source(
                     &source, &range, language,
@@ -31322,7 +33115,27 @@ fn exec_sink_pack_verdict(
         Ok(commands) => commands,
         Err(error) => {
             tracing::debug!(%error, "interpreter literal analysis did not complete");
-            return Some(EvaluationResult::indeterminate_due_to_budget());
+            // An optional recovery that could not finish (a grammar error, a
+            // node/literal limit, its own 20 ms budget) is neither evidence
+            // about the program nor exhaustion of the hook deadline. Returning
+            // a budget Indeterminate here pre-empted every later layer — so
+            // `python3 -c '…os.system(sys.stdin.read())' <<'PY'` lost the pack
+            // denial of the body it executes — and reported a grammar error as
+            // "could not complete safety evaluation within 5000ms" (#565).
+            // Record the incomplete analysis for the request instead: a later
+            // positive finding still denies, and every would-be allow becomes
+            // Indeterminate at the evaluation boundary. Only an exhausted
+            // deadline, or a caller with no evaluation scope to carry the
+            // record, still stops here.
+            if deadline_exceeded(context.deadline)
+                || !crate::packs::regex_engine::record_incomplete_analysis(
+                    "interpreter_literal_recovery",
+                    &error,
+                )
+            {
+                return Some(EvaluationResult::indeterminate_due_to_budget());
+            }
+            return None;
         }
     };
     reconstructed_interpreter_commands_verdict(command, content, context, recovered)
@@ -31654,6 +33467,7 @@ fn check_credential_write_fallback(
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -31682,6 +33496,27 @@ fn fallback_pattern_hit(command: &str) -> bool {
     static FALLBACK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
         RegexSet::new([
             r"shutil\.rmtree",
+            // An imported recursive delete can have any local name. If the
+            // bounded AST pass could not finish, `wipe(...)` alone gives this
+            // backstop no sink name to recognize. Keep the real import as an
+            // incomplete-analysis signal, including grouped imports and line
+            // continuations. This is deliberately not proof of a call: a
+            // completed AST pass checks bindings and the actual target, while
+            // this path cannot establish that the imported capability is unused.
+            // Match source names, so `copy as rmtree` does not create a signal.
+            r"(?x)
+                \bfrom (?:\s|\\\r?\n)+ shutil (?:\s|\\\r?\n)+ import
+                (?:\s|\\\r?\n)+ \(?
+                (?:\s|\\\r?\n|\#[^\r\n]*)*
+                (?:
+                    \w+ (?:
+                        (?:\s|\\\r?\n|\#[^\r\n]*)+ as
+                        (?:\s|\\\r?\n|\#[^\r\n]*)+ \w+
+                    )?
+                    (?:\s|\\\r?\n|\#[^\r\n]*)* ,
+                    (?:\s|\\\r?\n|\#[^\r\n]*)*
+                )*
+                (?: rmtree\b | \* )",
             r"os\.remove",
             r"os\.rmdir",
             r"os\.unlink",
@@ -32018,6 +33853,16 @@ fn apply_effective_confidence(
         score: None,
         downgraded: false,
     };
+    if result.regex_evaluation_incomplete {
+        return ConfidenceResult {
+            mode: if mode == crate::packs::DecisionMode::Deny || config.unverified_denies() {
+                crate::packs::DecisionMode::Deny
+            } else {
+                crate::packs::DecisionMode::Ask
+            },
+            ..unchanged
+        };
+    }
     let Some(info) = result
         .pattern_info
         .as_ref()
@@ -32029,6 +33874,8 @@ fn apply_effective_confidence(
     if !config.confidence.enabled {
         return unchanged;
     }
+
+    let regex_scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
 
     let sanitized = sanitize_for_pattern_matching(command);
     let normalized_command = crate::normalize::normalize_command(command);
@@ -32094,7 +33941,14 @@ fn apply_effective_confidence(
             downgraded: false,
         };
     }
-    scored
+    // Failure while looking for further occurrences supplies no evidence for
+    // weakening the original finding. This path also runs after the primary
+    // evaluator has returned, so it needs its own request-local scope.
+    if regex_scope.has_failed() {
+        unchanged
+    } else {
+        scored
+    }
 }
 
 /// Upper bound on the other occurrences [`confident_repeat_of_rule`] scores
@@ -32447,6 +34301,17 @@ pub fn apply_confidence_scoring(
     current_mode: crate::packs::DecisionMode,
     config: &crate::config::ConfidenceConfig,
 ) -> ConfidenceResult {
+    if result.regex_evaluation_incomplete {
+        return ConfidenceResult {
+            mode: if current_mode == crate::packs::DecisionMode::Deny {
+                current_mode
+            } else {
+                crate::packs::DecisionMode::Ask
+            },
+            score: None,
+            downgraded: false,
+        };
+    }
     // If confidence scoring is disabled, return unchanged mode
     if !config.enabled {
         return ConfidenceResult {
@@ -32541,6 +34406,9 @@ pub fn apply_branch_strictness(
     config: &Config,
     project_path: Option<&Path>,
 ) -> EvaluationResult {
+    if result.regex_evaluation_incomplete {
+        return result;
+    }
     // Early return if git awareness is disabled
     let git_awareness = &config.git_awareness;
     if !git_awareness.enabled {
@@ -32625,50 +34493,88 @@ mod tests {
 
     #[test]
     fn documentation_mask_timeout_keeps_live_worker_permit() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
-        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let active = Arc::new(AtomicBool::new(false));
         let (release, wait) = std::sync::mpsc::channel();
         let (finished, completion) = std::sync::mpsc::channel();
-        let result = run_documentation_mask_worker(&ACTIVE, Duration::from_millis(10), move || {
-            // Simulate a parser that cannot observe cooperative checks.
-            // The safety timeout also releases this test worker on panic.
-            let _ = wait.recv_timeout(Duration::from_secs(5));
-            let _ = finished.send(());
-            Some("late mask".to_string())
-        });
+        let result = run_documentation_mask_worker(
+            Arc::clone(&active),
+            Duration::from_millis(10),
+            move || {
+                // Simulate a parser that cannot observe cooperative checks.
+                // The safety timeout also releases this test worker on panic.
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+                let _ = finished.send(());
+                Some("late mask".to_string())
+            },
+        );
         assert!(result.is_none(), "expired analysis must not produce a mask");
         assert!(matches!(
             completion.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
-        assert!(ACTIVE.load(Ordering::Acquire));
+        assert!(active.load(Ordering::Acquire));
         assert!(
-            run_documentation_mask_worker(&ACTIVE, Duration::from_secs(1), || {
-                panic!("a live parser must retain the only worker permit")
-            })
+            run_documentation_mask_worker(
+                Arc::clone(&active),
+                Duration::from_secs(1),
+                || -> Option<String> { panic!("a live parser must retain the only worker permit") }
+            )
             .is_none()
         );
         release.send(()).unwrap();
         completion.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
+    /// The documentation mask is a pure function of the command, and the
+    /// per-segment pack passes ask for it once per segment. It used to extract
+    /// and re-parse the whole command every time: about fifty analyses for one
+    /// 300-line documentation heredoc (#555). A completed analysis is reused.
+    #[test]
+    fn documentation_mask_analysis_runs_once_per_source_issue_555() {
+        let source = "python3 - <<'PY'\ns = \"run `git branch -d x` later\"\nprint(s)\nPY";
+        let other = "python3 - <<'PY'\ns = \"run `git status` later\"\nprint(s)\nPY";
+        let before = DOCUMENTATION_MASK_ANALYSES.with(std::cell::Cell::get);
+        let first = mask_proven_interpreter_documentation(source).into_owned();
+        for _ in 0..8 {
+            assert_eq!(mask_proven_interpreter_documentation(source), first);
+        }
+        assert_ne!(first, source, "the proven literal is masked");
+        let after_repeats = DOCUMENTATION_MASK_ANALYSES.with(std::cell::Cell::get);
+        assert_eq!(
+            after_repeats - before,
+            1,
+            "repeats reuse the completed analysis"
+        );
+        let _ = mask_proven_interpreter_documentation(other);
+        assert_eq!(
+            DOCUMENTATION_MASK_ANALYSES.with(std::cell::Cell::get) - before,
+            2,
+            "a different source is analysed on its own"
+        );
+    }
+
     #[test]
     fn documentation_mask_completed_worker_releases_permit() {
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
-        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let active = Arc::new(AtomicBool::new(false));
         assert_eq!(
-            run_documentation_mask_worker(&ACTIVE, Duration::from_secs(5), || {
+            run_documentation_mask_worker(Arc::clone(&active), Duration::from_secs(5), || {
                 Some("completed mask".to_string())
             }),
             Some("completed mask".to_string())
         );
-        assert!(!ACTIVE.load(Ordering::Acquire));
+        assert!(!active.load(Ordering::Acquire));
         assert!(
-            run_documentation_mask_worker(&ACTIVE, Duration::ZERO, || {
-                panic!("an expired budget must not start a worker")
-            })
+            run_documentation_mask_worker(
+                Arc::clone(&active),
+                Duration::ZERO,
+                || -> Option<String> { panic!("an expired budget must not start a worker") }
+            )
             .is_none()
         );
     }
@@ -32691,6 +34597,104 @@ mod tests {
                     if source.trim() == "print(\"```\")"
             )),
             "the independent shell source must retain its dialect: {sinks:?}"
+        );
+    }
+
+    #[test]
+    fn posix_eval_keeps_quoted_interpreter_source_in_its_language_544() {
+        for command in [
+            "node - <<'DOC'\nconst cp = require(\"child_process\"); const s = \"git reset --hard\"; eval(\"cp.execSync(s)\");\nDOC",
+            "node - <<'DOC'\nconst s = 'git reset --hard'; eval('console.log(s)');\nDOC",
+            "python3 - <<'DOC'\ns = 'git reset --hard'; eval('print(s)')\nDOC",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let sinks = collect_executable_text_sinks(command, dialect);
+                assert!(
+                    sinks.is_empty(),
+                    "the interpreter owns this eval: {command:?}, {dialect:?}: {sinks:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posix_eval_retains_outer_and_unproven_source_544() {
+        for command in [
+            "node - <<'DOC'\nconsole.log('safe')\nDOC\neval \"$COMMAND\"",
+            "node - <<DOC\nconst s = 'safe'; eval(s);\nDOC",
+            "sh <<'DOC'\neval \"$COMMAND\"\nDOC",
+            "runner <<'DOC'\neval \"$COMMAND\"\nDOC",
+            "PATH=./tools:$PATH node - <<'DOC'\nconst s = 'safe'; eval(s);\nDOC",
+            "node() { sh; }; node - <<'DOC'\neval \"$COMMAND\"\nDOC",
+            "node - <<'DOC' | sh\nconst s = 'safe'; eval(s);\nDOC",
+        ] {
+            let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+            assert!(
+                sinks.iter().any(|sink| matches!(
+                    sink,
+                    ExecutableTextSink::Unverified {
+                        rule: EVAL_DYNAMIC_RULE,
+                        ..
+                    }
+                )),
+                "unproven or outer shell eval must remain visible: {command:?}: {sinks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_eval_keeps_raw_pipeline_and_static_outer_source_544() {
+        let command = "cat <<'DOC' | sh\neval \"$COMMAND\"\nDOC";
+        let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::Payload {
+                    source,
+                    dialect: ShellDialect::Posix,
+                    ..
+                } if source.trim() == "eval \"$COMMAND\""
+            )),
+            "the shell consumer must receive the raw body: {command:?}: {sinks:?}"
+        );
+
+        // This process-substitution layout has no static producer proof. Both
+        // existing denial paths must remain visible in the original source.
+        let command = "tee >(sh) <<'DOC'\neval \"$COMMAND\"\nDOC";
+        let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::Unverified {
+                    rule: EVAL_DYNAMIC_RULE,
+                    ..
+                }
+            )),
+            "the shell eval must remain unverified: {sinks:?}"
+        );
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::UnverifiedSource {
+                    rule: PIPELINE_CONSUMER_RULE,
+                    ..
+                }
+            )),
+            "the shell consumer must remain unverified: {sinks:?}"
+        );
+
+        let command = "node - <<'DOC'\neval('console.log(1)');\nDOC\neval 'git reset --hard'";
+        let sinks = collect_executable_text_sinks(command, ShellDialect::Posix);
+        assert!(
+            sinks.iter().any(|sink| matches!(
+                sink,
+                ExecutableTextSink::Payload {
+                    source,
+                    dialect: ShellDialect::Posix,
+                    ..
+                } if source == "git reset --hard"
+            )),
+            "the independent shell eval must retain its source: {sinks:?}"
         );
     }
 
@@ -33269,10 +35273,21 @@ mod tests {
             "my_printf -v p x",
             "printfoo -v p x",
             "p=/tmp/x.txt; echo hi > \"$p\"",
+            // #574: options end at the format, so an expansion or quoting
+            // after it cannot become `-v`.
+            "printf a \"$(true)\"",
+            "printf a $(true)",
+            "printf a `true`",
+            "printf %s \"$x\" '-v' p",
+            "p=/tmp/x; { printf a \"$(true)\"; } > \"$p/o\"",
+            // #574: `-v` naming a different, literal variable leaves `p` alone.
+            "printf -v other a",
+            "printf -vother a \"$(true)\"",
+            "p=/tmp/x; printf -v other a; cat a > \"$p/o\"",
         ] {
             assert!(
-                !printf_can_bind_variable(inert),
-                "{inert:?} cannot bind a variable"
+                !printf_can_bind_variable(inert, "p"),
+                "{inert:?} cannot bind p"
             );
         }
         for binds in [
@@ -33321,10 +35336,549 @@ mod tests {
             "printf -\"v\" p /etc/passwd",
             "printf \\-v p /etc/passwd",
             "p=/tmp/x.txt; printf \"-v\" p /etc/passwd; echo hi > \"$p\"",
+            // Still option position: the second `-v` binds p.
+            "printf -v other -v p x",
+            "printf -n -v p x",
+            "printf -- -v p x",
+            // A target that is not a plain literal name could be p.
+            "printf -v \"$t\" x",
+            "printf -v 'p' x",
+            "printf -v p[0] x",
+            // Expansion, glob or brace expansion before the format.
+            "printf \"$(true)\" p x",
+            "printf * x",
+            "printf {-v,p} x",
         ] {
             assert!(
-                printf_can_bind_variable(binds),
+                printf_can_bind_variable(binds, "p"),
                 "{binds:?} must stay a mutation hazard"
+            );
+        }
+    }
+
+    /// #574: `read` binds only the names it is given (or `REPLY`), plus its
+    /// `-a` array. Anything it cannot read statically stays a hazard.
+    #[test]
+    fn read_binds_only_named_variables() {
+        for inert in [
+            "read x",
+            "read -r line",
+            "read -r -p prompt line",
+            "read -rp prompt line",
+            "read -t 5 -u 3 a b c",
+            "read -a arr",
+            "read -r line < /etc/hostname",
+            "read -r line </etc/hostname",
+            "read -r a b <<< x",
+            "IFS=, read a b",
+            "p=/tmp/x; read x; cat a > \"$p/o\"",
+            "sys.stdin.read() > out",
+            "readonly q=1",
+        ] {
+            assert!(
+                !read_can_bind_variable(inert, "p"),
+                "{inert:?} cannot bind p"
+            );
+        }
+        for binds in [
+            "read p",
+            "read -r x p",
+            "read -a p",
+            "read -ra p",
+            "read -- p",
+            // No name: REPLY.
+            "read",
+        ] {
+            let name = if binds == "read" { "REPLY" } else { "p" };
+            assert!(
+                read_can_bind_variable(binds, name),
+                "{binds:?} must bind {name}"
+            );
+        }
+        for unreadable in [
+            "read $v",
+            "read \"$v\"",
+            "read 'p'",
+            "read p[0]",
+            "read -X p",
+            "read -a",
+            "read x $(echo p)",
+            "read -p \"two words\" p",
+            "read * ",
+        ] {
+            assert!(
+                read_can_bind_variable(unreadable, "p"),
+                "{unreadable:?} is not statically readable and must stay a hazard"
+            );
+        }
+    }
+
+    /// #574: an assignment-only segment performs every assignment in it, so a
+    /// sibling assignment no longer hides the binding a redirect relies on.
+    #[test]
+    fn assignment_only_segments_bind_each_name_574() {
+        assert_eq!(
+            assignment_only_segment_binding("B=/tmp/b T=/tmp/t", "B"),
+            AssignmentOnlyBinding::Binds("/tmp/b")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B=/tmp/b T=/tmp/t", "T"),
+            AssignmentOnlyBinding::Binds("/tmp/t")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B=$(mktemp -d) T=$(mktemp)", "B"),
+            AssignmentOnlyBinding::Binds("$(mktemp -d)")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B='a b' T=\"c d\"", "T"),
+            AssignmentOnlyBinding::Binds("\"c d\"")
+        );
+        assert_eq!(
+            assignment_only_segment_binding("B=/tmp/b T=/tmp/t", "X"),
+            AssignmentOnlyBinding::DoesNotBind
+        );
+        for ambiguous in [
+            "B=/tmp/b B=/home/u",
+            "B=/tmp/b B+=/x",
+            "B=/tmp/b B[1]=/x",
+            "B=/tmp/b IFS=/",
+        ] {
+            assert_eq!(
+                assignment_only_segment_binding(ambiguous, "B"),
+                AssignmentOnlyBinding::Ambiguous,
+                "{ambiguous:?}"
+            );
+        }
+        for not_assignment_only in [
+            "B=/tmp/b",
+            "B=/tmp/b cmd",
+            "B=/tmp/b T=/tmp/t cmd",
+            "B=/tmp/b >out",
+            "B=(a b) T=/tmp/t",
+            "B='unterminated T=/tmp/t",
+        ] {
+            assert_eq!(
+                assignment_only_segment_binding(not_assignment_only, "B"),
+                AssignmentOnlyBinding::NotAssignmentOnly,
+                "{not_assignment_only:?}"
+            );
+        }
+    }
+
+    /// #583 end to end: a literal `cd` around a written JavaScript file and its
+    /// `node` run keeps arrow functions out of the redirect rules.
+    #[test]
+    fn written_javascript_survives_literal_cd_steps_583() {
+        for body in ["f(u => !x);", "const label = (u) => `${u.name}`;"] {
+            for command in [
+                format!("cat > /tmp/x/a.js <<'EOF'\n{body}\nEOF\ncd /tmp && node /tmp/x/a.js"),
+                format!("cd /tmp && cat > /tmp/x/a.js <<'EOF'\n{body}\nEOF\nnode /tmp/x/a.js"),
+            ] {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &command,
+                    &["core.filesystem"],
+                    ShellDialect::Posix,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "{command:?} must stay allowed: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        for command in [
+            "cat > /tmp/x/a.sh <<'EOF'\nrm -rf /home/user\nEOF\ncd /tmp && bash /tmp/x/a.sh",
+            "cd /tmp && cat > /tmp/x/a.sh <<'EOF'\nrm -rf /home/user\nEOF\nbash /tmp/x/a.sh",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #583 row 4 end to end: `cat > f <<'EOF' && node f` keeps arrow
+    /// functions out of the redirect rules, and a program written and run in
+    /// that shape receives its own language's checks (it was allowed unseen).
+    #[test]
+    fn written_script_with_a_heredoc_line_consumer_583() {
+        for body in [
+            "f(u => !x);",
+            "const label = (u) => `${u.name}`;",
+            "const label = 'name';",
+        ] {
+            let command = format!("cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\n{body}\nEOF");
+            let result = evaluate_with_pack_ids_in_dialect(
+                &command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must be allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\nrm -rf /home/user\nEOF",
+            "cat > /tmp/x/a.sh <<'EOF' && bash /tmp/x/a.sh\necho bad > $TARGET\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' || node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js && bash /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF\nbash /tmp/x/a.js",
+            "cat > /tmp/x/a.js <<'EOF' && node $F\nf(u => !x);\nEOF",
+            "cd /tmp && cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nf(u => !x);\nrequire('child_process').execSync('echo bad > /etc/passwd');\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nrequire('child_process').execSync('rm -rf /home/user');\nEOF",
+            "cat > /tmp/x/a.js <<'EOF' && node /tmp/x/a.js\nrequire('fs').rmSync('/home/user', {recursive: true});\nEOF",
+            "cat > /tmp/x/a.py <<'EOF' && python3 /tmp/x/a.py\nimport shutil\nshutil.rmtree('/home/user')\nEOF",
+            "cat > /tmp/x/a.py <<'EOF' && python3 /tmp/x/a.py\nimport subprocess\nsubprocess.run(['rm', '-rf', '/home/user'])\nEOF",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must be denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #575 end to end: an unspaced append is an append.
+    #[test]
+    fn unspaced_append_to_a_dynamic_path_is_allowed_575() {
+        for command in [
+            "echo done >>\"$LOG\"",
+            "echo done >>$LOG",
+            "echo done 2>>\"$LOG\"",
+            "echo done &>>\"$LOG\"",
+            "echo done >>\"$HOME/notes.txt\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "echo done >\"$LOG\"",
+            "echo done 2>$LOG",
+            "echo x >>~/.bashrc",
+            "echo x >>\"$HOME/.bashrc\"",
+            "echo a >>/tmp/x >\"$LOG\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #548 end to end: force evidence for `docker rm`/`rmi` and `umount` comes
+    /// only from that command's own option words.
+    #[test]
+    fn force_removal_rules_take_flags_from_their_own_command_548() {
+        let packs = ["core.filesystem", "containers.docker", "system.disk"];
+        for command in [
+            "docker image rm cve-followup/web:1.2",
+            "docker rm probe-xf",
+            "docker rm probe-a probe-b; docker ps -a --format '{{.Names}}'",
+            "docker network rm probe-net && grep -f patterns.txt file.txt",
+            "cat docker-compose.yml && rm -f /tmp/a",
+            "flock /tmp/l docker run --rm --platform linux/arm64 alpine true",
+            "mytool run -- docker run --rm --platform linux/arm64 alpine true",
+            "sudo umount /mnt/x; sudo ip netns delete drill-firewall-test",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for (command, rule) in [
+            ("docker rm -f probe-a", "rm-force"),
+            ("docker rm probe-a -f", "rm-force"),
+            ("flock /tmp/l docker rm -f c1", "rm-force"),
+            ("docker ps -a; docker rm -f c1", "rm-force"),
+            ("docker rmi -f img", "rmi-force"),
+            ("sudo umount -f /mnt/x", "umount-force"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some(rule),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn operand_launchers_expose_the_program_they_run() {
+        for (segment, argv0, expected) in [
+            ("find . -name x -exec unlink {} \\;", "find", vec!["unlink"]),
+            (
+                "find / -execdir rm {} + -ok chmod 777 {} \\;",
+                "find",
+                vec!["rm", "chmod"],
+            ),
+            ("find . -name unlink -print", "find", vec![]),
+            ("xargs unlink", "xargs", vec!["unlink"]),
+            (
+                "xargs -I {} -P 4 /usr/bin/unlink {}",
+                "xargs",
+                vec!["unlink"],
+            ),
+            ("xargs -0 -n1 grep -l unlink", "xargs", vec!["grep"]),
+            // Optional-value options take no separate word.
+            ("xargs -l unlink", "xargs", vec!["unlink"]),
+            ("xargs -e unlink", "xargs", vec!["unlink"]),
+            ("flock /tmp/l unlink /etc/passwd", "flock", vec!["unlink"]),
+            (
+                "flock -w 5 -n 9 'unlink' /etc/passwd",
+                "flock",
+                vec!["unlink"],
+            ),
+            ("flock /tmp/l -c 'unlink /etc/passwd'", "flock", vec![]),
+            ("doas -u root unlink /etc/passwd", "doas", vec!["unlink"]),
+            ("parallel -j 4 unlink ::: a b", "parallel", vec!["unlink"]),
+            (
+                "parallel ::: 'unlink /etc/passwd' true",
+                "parallel",
+                vec!["unlink", "passwd", "true"],
+            ),
+            // Unmodeled grammars: every non-option operand.
+            ("watch -n 5 unlink x", "watch", vec!["5", "unlink", "x"]),
+            (
+                "strace -f -o log unlink x",
+                "strace",
+                vec!["log", "unlink", "x"],
+            ),
+            (
+                "chroot /srv/root unlink x",
+                "chroot",
+                vec!["root", "unlink", "x"],
+            ),
+            ("ls unlink", "ls", vec![]),
+            ("cat unlink /tmp/x", "cat", vec![]),
+        ] {
+            assert_eq!(
+                operand_launched_executables(segment, argv0),
+                expected,
+                "{segment:?}"
+            );
+        }
+    }
+
+    /// #550 end to end: `unlink`/`mv` inside a longer token is not the command,
+    /// while launchers that run their operand stay covered. An argv0-scoped
+    /// unlink rule allowed every launcher row below.
+    #[test]
+    fn unlink_and_mv_rules_judge_the_command_word_550() {
+        for command in [
+            "ob sync-unlink --path /home/user/vault",
+            "foo --unlink /tmp/x",
+            "printf '%s' unlink /etc/passwd",
+            "cat unlink /tmp/x",
+            "find . -name unlink -print",
+            "git ls-files | xargs grep -n unlink src",
+            "find . -name '*.log' | xargs wc -l",
+            // An `-I` placeholder template is judged by the command it runs.
+            "find . -name '*.log' | xargs -I{} grep -n unlink {}",
+            "xargs -I{} echo unlink {}",
+            "cat list | xargs -I {} wc -l {}",
+            "xargs -I{} sh -c 'echo {}'",
+            "watch -n 5 ls /etc",
+            "git checkout -b fix-mv-handling /home/user/repo",
+            "tool x-mv /home/user/repo",
+            "tool --no-mv /etc/hosts",
+            "unlink /tmp/scratch/file",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "{command:?} must stay allowed: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "'unlink' /home/user/notes.txt",
+            "\"unlink\" /etc/passwd",
+            "find . -name x -exec unlink {} \\;",
+            "find /etc -name passwd -exec unlink {} +",
+            "flock /tmp/l unlink /etc/passwd",
+            "doas unlink /etc/passwd",
+            "parallel unlink ::: /etc/passwd",
+            // xargs supplies unlink's operands from its input, so they are
+            // never a proven temp path.
+            "xargs unlink",
+            "xargs unlink < list",
+            "xargs -0 unlink",
+            "cat list | xargs -n1 unlink",
+            "xargs -n1 /usr/bin/unlink /tmp/x",
+            // The `-I` placeholder is the word that ends xargs' options. The
+            // sanitizer used to blank it, so every parser read `unlink` as the
+            // placeholder value and these were ALLOWED.
+            "xargs -I{} unlink {}",
+            "xargs -I {} unlink {}",
+            "xargs -I{} unlink {} < list",
+            "cat list | xargs -I{} unlink {}",
+            "find . -name '*.tmp' | xargs -I{} unlink {}",
+            "xargs -I% unlink %",
+            "xargs -I % unlink %",
+            "xargs -I{} unlink ./{}",
+            "xargs -I {} -P 4 unlink {}",
+            "xargs -0 -I{} unlink {}",
+            "xargs -I{} /usr/bin/unlink {}",
+            "xargs -i unlink {}",
+            "xargs --replace={} unlink {}",
+            "parallel ::: 'unlink /etc/passwd'",
+            "flock /tmp/l -c 'unlink /etc/passwd'",
+            "sudo find / -name passwd -exec unlink {} \\;",
+            "watch unlink /etc/passwd",
+            "strace -f unlink /etc/passwd",
+            "chroot /srv/root unlink /etc/passwd",
+            "sudo unlink /etc/sudoers",
+            "mv /home/user/repo /tmp/r",
+            "'mv' /home/user/repo /tmp/r",
+            // Words the shell still reads as `mv`.
+            "mv\"\" /etc /tmp/x",
+            "mv'' /home/user/repo /tmp/r",
+            "mv>/dev/null /etc /tmp/x",
+            "mv</dev/null /home/user/repo /tmp/r",
+            "mv\"\" \"$src\" d/",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "{command:?} must stay denied: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// An `xargs -I` placeholder must survive sanitization: blanking it made
+    /// every executable-scoped rule read the child command as the placeholder
+    /// value, so `xargs -I{} chmod 777 {}` was allowed and the harmless
+    /// `xargs -I{} echo chmod 777 {}` was the one attributed to chmod.
+    #[test]
+    fn xargs_placeholder_templates_keep_executable_scoped_rules() {
+        for command in [
+            "xargs -I{} chmod 777 {}",
+            "find . -type f | xargs -I {} chmod 777 {}",
+            "xargs -I% chmod 777 %",
+            "xargs chmod 777",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "the template runs chmod: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "xargs -I{} echo chmod 777 {}",
+            "xargs -I {} printf '%s\\n' chmod 777 {}",
+            "xargs -I{} ls -l {}",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "the template runs no chmod: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #574 end to end: the literal temp binding survives a grouped printf with
+    /// a substitution argument, a sibling prefix assignment, and a mutator that
+    /// names another variable, while every real rebinding still denies.
+    #[test]
+    fn redirect_binding_survives_unrelated_mutators_574() {
+        for command in [
+            "S=/tmp/x; { printf a \"$(true)\"; } > \"$S/o\"",
+            "S=/tmp/x; { printf a $(true); } > \"$S/o\"",
+            "S=/tmp/x; { printf a `true`; } > \"$S/o\"",
+            "B=/tmp/b T=/tmp/t && cat a > \"$B\"",
+            "B=/tmp/b T=/tmp/t; cat a > \"$B\"",
+            "B=$(mktemp) T=$(mktemp) && cat a > \"$B\"",
+            "S=/tmp/x; read x; cat a > \"$S/o\"",
+            "S=/tmp/x; printf -v other a; cat a > \"$S/o\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "proven /tmp redirect must stay allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "S=/tmp/x; printf -v S a; cat a > \"$S/o\"",
+            "S=/tmp/x; read S; cat a > \"$S/o\"",
+            "S=/tmp/x; read -a S; cat a > \"$S/o\"",
+            "S=/tmp/x; read; cat a > \"$REPLY/o\"",
+            "S=/home/u; cat a > \"$S/.bashrc\"",
+            "B=/tmp/b B=/home/u/.bashrc && cat a > \"$B\"",
+            "B=/tmp/b IFS=/ && cat a > $B",
+            "B=/tmp/b cmd && cat a > \"$B\"",
+            "S=/tmp/x; printf \"$(echo -v)\" S /etc; cat a > \"$S/o\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven or sensitive redirect target must stay denied: {command:?}: {:?}",
+                result.pattern_info
             );
         }
     }
@@ -33428,6 +35982,106 @@ mod tests {
 
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
+    }
+
+    /// A module-scope Python string/`Path` constant in an archive-only tar
+    /// argv resolves to its literal value, so the archive is allowed exactly
+    /// as the literal inline (#562), while every operand whose value is not
+    /// provably fixed, and every constant whose literal is itself a tar option,
+    /// still denies.
+    #[test]
+    fn python_module_constant_tar_argv_resolves_to_its_literal_562() {
+        let packs = ["core.filesystem", "core.git", "system.disk"];
+        let dq = |s: &str| format!("python3 -c \"{}\"", s.replace('"', "\\\""));
+        // Archive-only tar whose member/dir is a proven constant: allowed.
+        for program in [
+            "import subprocess; name = 'checkout'; subprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', name])",
+            "from pathlib import Path; import subprocess; source = Path('/tmp/dcg-synthetic/checkout'); subprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])",
+            "import pathlib, subprocess; source = pathlib.Path('/tmp/dcg-synthetic/checkout'); subprocess.Popen(['tar', '-cf', '-', '-C', str(source.parent), source.name])",
+            "import subprocess; subprocess.Popen(['tar', '-cf', '-', '-C', '/tmp/dcg-synthetic', 'checkout'])",
+        ] {
+            let command = dq(program);
+            let result = evaluate_with_pack_ids(&command, &packs);
+            assert!(result.is_allowed(), "{program} -> {result:?}");
+        }
+        // The fold must never turn a non-fixed or option-valued operand into an
+        // allow. Each of these keeps the deny it had before the fold.
+        for program in [
+            // Unknown value.
+            "import subprocess, sys; subprocess.Popen(['tar', '-xf', 'a.tar', sys.argv[1]])",
+            // Constant whose literal IS a helper-exec option: resolving to the
+            // true value still denies.
+            "import subprocess; name = '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            "import subprocess; name = '-I'; subprocess.Popen(['tar', '-cf', 'a.tar', name, 'sh', 'x'])",
+            "import subprocess; name = 'checkout'; name = '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            "import subprocess; name = 'x'; name += '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            // Reflection or import-* can rebind the name out of view.
+            "import subprocess; name = 'checkout'; globals()['name'] = '--to-command=sh'; subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            "import subprocess; name = 'checkout'; exec('name = 1'); subprocess.Popen(['tar', '-xf', 'a.tar', name])",
+            // str / Path rebound (simple name or attribute).
+            "import subprocess; from pathlib import Path; str = lambda x: '--to-command=sh'; source = Path('/tmp/x/checkout'); subprocess.Popen(['tar', '-xf', 'a.tar', str(source)])",
+            "import subprocess; from pathlib import Path; Path.name = '--to-command=sh'; source = Path('/tmp/x/checkout'); subprocess.Popen(['tar', '-xf', 'a.tar', source.name])",
+            // An f-string operand is not a resolvable constant.
+            "import subprocess; name = 'sh'; subprocess.Popen(['tar', '-xf', 'a.tar', f'--to-command={name}'])",
+            // A star-args argv cannot be verified.
+            "import subprocess; args = ['--to-command=sh']; subprocess.Popen(['tar', '-xf', 'a.tar', *args])",
+        ] {
+            let command = dq(program);
+            let result = evaluate_with_pack_ids(&command, &packs);
+            assert!(
+                result.is_denied(),
+                "fold must not open a bypass: {program} -> {result:?}"
+            );
+        }
+    }
+
+    /// An inert redirection selects no pack (#571): `ls 2>/dev/null` used to
+    /// select `core.filesystem` and `system.disk` through the `2>`, `>/` and
+    /// `/dev/` keywords and compile both, though no rule could match it. It is
+    /// now quick-rejected like `ls`, while a destructive redirection or command
+    /// beside it is still judged against the full text.
+    #[test]
+    fn inert_redirections_select_no_pack_issue_571() {
+        let packs = ["core.filesystem", "core.git", "system.disk"];
+        for command in [
+            "ls 2>/dev/null",
+            "ls >/dev/null 2>&1",
+            "ls &>/dev/null",
+            "cat notes.txt </dev/null",
+            "echo done >&2",
+            "cargo build --release 2>&1 | tail -5",
+            "ps -o pid,rss -p 1 2>/dev/null; free -g",
+        ] {
+            // The Bash hook's dialect: no pack is selected at all.
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed() && result.quick_rejected,
+                "{command} -> {result:?}"
+            );
+            // The all-dialect view still replays cmd/PowerShell readings, where
+            // `>` and `&` mean other things; the verdict is the same.
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Unknown);
+            assert!(
+                result.is_allowed(),
+                "{command} (unknown dialect) -> {result:?}"
+            );
+        }
+        for command in [
+            "rm -rf ~ 2>/dev/null",
+            "ls 2>/dev/null; rm -rf ~",
+            "ls 2>/dev/null >/etc/hosts",
+            "echo x 2>&1 >/dev/sda",
+            "echo x >&/etc/passwd",
+            "dd if=/dev/zero of=/dev/sda 2>/dev/null",
+            "tee /dev/sda < /dev/zero 2>/dev/null",
+            "git reset --hard 2>/dev/null",
+            ": > /etc/hosts 2>&1",
+            "truncate -s 0 /etc/hosts 2>/dev/null",
+            "wipefs -a /dev/sda >/dev/null 2>&1",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(result.is_denied(), "{command} -> {result:?}");
+        }
     }
 
     /// `$IFS` word-splits to whitespace by default, so `rm${IFS}-rf${IFS}~`
@@ -37663,6 +40317,228 @@ mod tests {
     }
 
     #[test]
+    fn nested_interpreter_heredocs_are_scanned_without_shell_pack_keywords() {
+        for shell in ["bash", "sh"] {
+            let command = format!(
+                "{shell} <<'OUTER'\npython3 <<'PY'\nimport shutil\nshutil.rmtree('/home/example/project')\nPY\nOUTER"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(&command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "nested Python must be analyzed independently of git keywords: {command:?}: {result:?}"
+            );
+
+            let safe = format!(
+                "{shell} <<'OUTER'\npython3 <<'PY'\nprint('hello from nested Python')\nPY\nOUTER"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(&safe, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "safe nested Python: {safe:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn here_string_receiver_analysis_preserves_bash_rule_allowlists_issue_555() {
+        let enabled_packs = ["core.git".to_string(), "core.filesystem".to_string()]
+            .into_iter()
+            .collect();
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let compiled = default_compiled_overrides();
+        let mut config = default_config();
+        config.heredoc.timeout_ms = Some(5_000);
+
+        for (body, core_rule, bash_rule) in [
+            ("rm -rf ./build", "core.filesystem:rm-rf-general", "rm_rf"),
+            (
+                "rm -r ./build",
+                "core.filesystem:rm-recursive-general",
+                "rm_r",
+            ),
+            ("git reset --hard", "core.git:reset-hard", "git_reset_hard"),
+            ("git clean -fd", "core.git:clean-force", "git_clean_fd"),
+        ] {
+            let core_allowed = project_allowlists_for_rule(core_rule, "reviewed core rule only");
+            let mut both_allowed = core_allowed.clone();
+            both_allowed.layers.extend(
+                project_allowlists_for_rule(
+                    &format!("heredoc.bash:{bash_rule}"),
+                    "separately reviewed Bash AST rule",
+                )
+                .layers,
+            );
+            for receiver in ["python3", "ruby", "node"] {
+                let direct = format!("{receiver} <<< '{body}'");
+                let rebound = format!("{receiver}() {{ bash; }}; {direct}");
+                for command in [direct, rebound] {
+                    for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                        // Excluding the receiving language must not exclude
+                        // the previously enabled Bash view as a side effect.
+                        for allowed_languages in
+                            [None, Some(vec![crate::heredoc::ScriptLanguage::Bash])]
+                        {
+                            let mut settings = config.heredoc_settings();
+                            settings.allowed_languages = allowed_languages;
+                            let evaluate = |allowlists: &LayeredAllowlist| {
+                                evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                                    &command,
+                                    &enabled_keywords,
+                                    &ordered_packs,
+                                    keyword_index.as_ref(),
+                                    &compiled,
+                                    allowlists,
+                                    &settings,
+                                    None,
+                                    None,
+                                    None,
+                                    dialect,
+                                )
+                            };
+                            let result = evaluate(&core_allowed);
+                            assert!(
+                                result.is_denied(),
+                                "a core allowlist cannot waive Bash AST analysis: {command:?}, \
+                                 {dialect:?}, {:?}: {result:?}",
+                                settings.allowed_languages
+                            );
+                            let info = result.pattern_info.expect("Bash AST denial has a rule");
+                            assert_eq!(info.pack_id.as_deref(), Some("heredoc.bash"));
+                            assert_eq!(info.pattern_name.as_deref(), Some(bash_rule));
+
+                            let result = evaluate(&both_allowed);
+                            assert!(
+                                result.is_allowed(),
+                                "both independent rules were explicitly reviewed: {command:?}, \
+                                 {dialect:?}, {:?}: {result:?}",
+                                settings.allowed_languages
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn here_string_bash_and_receiver_views_keep_independent_coverage_issue_555() {
+        // These deliberately narrow evaluator pack sets demonstrate that the
+        // Bash AST rules do not depend on the equivalent core pack running.
+        for receiver in ["python3", "ruby", "node", "\"python3\"", "python3.12"] {
+            for (body, pack_ids, expected_rule) in [
+                ("rm -rf ./build", &["core.git"][..], "rm_rf"),
+                ("rm -r ./build", &["core.git"][..], "rm_r"),
+                (
+                    "git reset --hard",
+                    &["core.filesystem"][..],
+                    "git_reset_hard",
+                ),
+                ("git clean -fd", &["core.filesystem"][..], "git_clean_fd"),
+            ] {
+                let command = format!("{receiver} <<< '{body}'");
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, pack_ids, ShellDialect::Posix);
+                assert!(result.is_denied(), "{command:?}: {result:?}");
+                let info = result.pattern_info.expect("Bash AST denial has a rule");
+                assert_eq!(info.pack_id.as_deref(), Some("heredoc.bash"));
+                assert_eq!(info.pattern_name.as_deref(), Some(expected_rule));
+            }
+        }
+
+        for command in [
+            "python3 <<< 'print(\"ready\")'",
+            "ruby <<< 'puts \"ready\"'",
+            "node <<< 'console.log(\"ready\")'",
+            "python3() { bash; }; python3 <<< 'git status'",
+            "ruby() { bash; }; ruby <<< 'git status'",
+            "node() { bash; }; node <<< 'git status'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "safe here-string: {command:?}: {result:?}"
+            );
+        }
+
+        for receiver in ["python3", "\"python3\"", "python3.12"] {
+            let command =
+                format!("{receiver} <<< 'import shutil; shutil.rmtree(\"/home/user/project\")'");
+            let result =
+                evaluate_with_pack_ids_in_dialect(&command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "receiver view still runs: {command:?}: {result:?}"
+            );
+            let info = result.pattern_info.expect("Python AST denial has a rule");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.python"));
+            assert_eq!(info.pattern_name.as_deref(), Some("shutil_rmtree"));
+        }
+    }
+
+    #[test]
+    fn here_string_wrapped_and_continued_interpreters_keep_verdicts_and_tails_issue_555() {
+        for receiver in [
+            "python3 -",
+            "\"python3\" -",
+            "python3.12 -",
+            "/opt/venv/bin/python3.12 -",
+            "\"/opt/venv bin/python3.12\" -",
+            "env \"python3\" -",
+            "env -i python3.12 -",
+            "command -- \"python3\" -",
+            "command env /opt/venv/bin/python3.12 -",
+            "python3 \\\n-",
+            "env \\\n\"python3\" -",
+            "command \\\npython3.12 -",
+        ] {
+            for (body, denied) in [
+                ("print(\"safe\")", false),
+                ("import shutil; shutil.rmtree(\"/home/user/project\")", true),
+            ] {
+                let direct = format!("{receiver} <<< '{body}'");
+                for command in [direct.clone(), format!("bash <<'OUTER'\n{direct}\nOUTER")] {
+                    let result = evaluate_with_pack_ids_in_dialect(
+                        &command,
+                        &["core.git"],
+                        ShellDialect::Posix,
+                    );
+                    if denied {
+                        assert!(result.is_denied(), "{command:?}: {result:?}");
+                        let info = result.pattern_info.expect("Python AST denial has a rule");
+                        assert_eq!(info.pack_id.as_deref(), Some("heredoc.python"));
+                        assert_eq!(info.pattern_name.as_deref(), Some("shutil_rmtree"));
+                    } else {
+                        assert!(result.is_allowed(), "{command:?}: {result:?}");
+                        let tail = format!("{command}\ngit reset --hard");
+                        let result = evaluate_with_pack_ids_in_dialect(
+                            &tail,
+                            &["core.git"],
+                            ShellDialect::Posix,
+                        );
+                        assert!(
+                            result.is_denied(),
+                            "later commands remain active: {tail:?}: {result:?}"
+                        );
+                        let info = result
+                            .pattern_info
+                            .expect("the later Git command has a rule");
+                        assert_eq!(info.pack_id.as_deref(), Some("core.git"));
+                        assert_eq!(info.pattern_name.as_deref(), Some("reset-hard"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn heredoc_triggers_inside_safe_string_arguments_do_not_scan_or_block() {
         let config = default_config();
         let compiled = default_compiled_overrides();
@@ -39354,6 +42230,138 @@ mod tests {
     }
 
     #[test]
+    fn quoted_unlink_reaches_its_rules_in_both_evaluator_paths_issue_550() {
+        let ordered_packs = ["core.filesystem".to_string()];
+        let enabled_keywords = crate::packs::core::filesystem::create_pack().keywords;
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for index in [None, keyword_index.as_ref()] {
+                let evaluate = |command| {
+                    evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                        command,
+                        enabled_keywords,
+                        &ordered_packs,
+                        index,
+                        &compiled,
+                        &allowlists,
+                        &heredoc_settings,
+                        None,
+                        None,
+                        None,
+                        dialect,
+                    )
+                };
+                for (command, rule) in [
+                    ("'unlink' /etc/passwd", "unlink-root-home"),
+                    ("'unlink' '/etc/passwd'", "unlink-root-home"),
+                    ("u'n'l'i'n'k' /etc/passwd", "unlink-root-home"),
+                    (r"un\link /etc/passwd", "unlink-root-home"),
+                    ("sudo 'unlink' /etc/passwd", "unlink-root-home"),
+                    ("'unlink' ./important.db", "unlink-general"),
+                    ("'unlink' /tmp/../etc/passwd", "unlink-general"),
+                    (
+                        r"unlink /tmp/cache\..\..\Users/user/notes.txt",
+                        "unlink-general",
+                    ),
+                    (
+                        r#""unlink" "/tmp/cache/..\..\Users/user/notes.txt""#,
+                        "unlink-general",
+                    ),
+                    (
+                        r"'unlink' '/tmp/cache/..\..\Users/user/notes.txt'",
+                        "unlink-general",
+                    ),
+                    ("u'n'l'i'n'k'>/tmp/log /etc/passwd", "unlink-general"),
+                    (
+                        "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+                        "unlink-root-home",
+                    ),
+                    ("echo $('unlink' /etc/passwd)", "unlink-root-home"),
+                    (
+                        "'unlink' /tmp/scratch > /etc/passwd",
+                        "credential-file-write",
+                    ),
+                    ("'unlink'>/etc/passwd /tmp/scratch", "credential-file-write"),
+                    ("'unlink' --help > /etc/passwd", "credential-file-write"),
+                ] {
+                    let result = evaluate(command);
+                    assert!(
+                        result.is_denied(),
+                        "{command:?}, dialect={dialect:?}, indexed={}: {result:?}",
+                        index.is_some()
+                    );
+                    assert_eq!(
+                        result
+                            .pattern_info
+                            .as_ref()
+                            .and_then(|info| info.pattern_name.as_deref()),
+                        Some(rule),
+                        "wrong rule for {command:?}, dialect={dialect:?}, indexed={}",
+                        index.is_some()
+                    );
+                }
+                for command in [
+                    "ob sync-unlink --path /home/user/vault",
+                    "foo --unlink /tmp/x",
+                    "cat unlink /tmp/x",
+                    "echo 'unlink' /etc/passwd",
+                    "'unlink' /tmp/scratch",
+                    "u'n'l'i'n'k' -- /var/tmp/cache",
+                    "'unlink' --help",
+                    "command -v 'unlink'",
+                ] {
+                    let result = evaluate(command);
+                    assert!(
+                        result.is_allowed(),
+                        "{command:?}, dialect={dialect:?}, indexed={}: {result:?}",
+                        index.is_some()
+                    );
+                }
+                let mut unexpected_temp_decisions = Vec::new();
+                for command in [
+                    "'unlink' '/tmp/file with spaces'",
+                    "'unlink' /tmp/\"literal;name\"",
+                    r#"unlink "/tmp/%DCG_ESCAPE%/notes.txt""#,
+                    r#"unlink /tmp/"%DCG_ESCAPE%/notes.txt""#,
+                    "unlink /tmp/%DCG_ESCAPE%/notes.txt",
+                    r#"unlink "/tmp/!DCG_ESCAPE!/notes.txt""#,
+                    "unlink /tmp/!DCG_ESCAPE!/notes.txt",
+                    r#"unlink "/tmp/"^.^."/Users/user/notes.txt""#,
+                    "unlink /tmp/^.^./Users/user/notes.txt",
+                    r#"unlink "/tmp/.. /Users/user/notes.txt""#,
+                    r#"unlink "/tmp/.../Users/user/notes.txt""#,
+                    "unlink /tmp/.../Users/user/notes.txt",
+                    r#"'unlink' "/tmp/cache./notes.txt""#,
+                    "unlink /tmp/cache./notes.txt",
+                ] {
+                    let result = evaluate(command);
+                    let rule = result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref());
+                    if result.is_allowed() != (dialect == ShellDialect::Posix)
+                        || (dialect == ShellDialect::Unknown && rule != Some("unlink-general"))
+                    {
+                        unexpected_temp_decisions.push(format!(
+                            "{command:?}, dialect={dialect:?}, indexed={}: {result:?}",
+                            index.is_some()
+                        ));
+                    }
+                }
+                assert!(
+                    unexpected_temp_decisions.is_empty(),
+                    "unexpected temp decisions:\n{}",
+                    unexpected_temp_decisions.join("\n")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn filesystem_rm_semantics_are_segment_local_in_both_evaluator_paths() {
         let enabled_keywords = ["rm", "find", "unlink", "sudo"];
         let ordered_packs = ["core.filesystem".to_string()];
@@ -40853,6 +43861,111 @@ mod tests {
         }
     }
 
+    /// #554: the single-quoted script of a direct `ssh host '…'` supplies its
+    /// own temporary binding, exactly as the same bytes do in a quoted
+    /// `ssh host <<'EOF'` body (#534) and in `bash -c '…'`. `mktemp -d` mints a
+    /// new, empty, uniquely named directory on whichever host runs it, and the
+    /// #275/#536 fold is lexical: it consults neither TMPDIR nor the local
+    /// filesystem, so the remote script borrows no local evidence.
+    #[test]
+    fn inline_ssh_scripts_supply_their_own_temporary_binding_issue_554() {
+        for command in [
+            "ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"'",
+            "ssh user@host.example 'T=$(mktemp -d /tmp/v-XXXXXX); echo x > \"$T/s\"'",
+            "/usr/bin/ssh h 'S=/tmp/sub; echo x > \"$S/out\"'",
+        ] {
+            assert_eq!(
+                embedded_bash_proven_redirect_offsets(command),
+                vec![command.find('>').unwrap()],
+                "the quoted remote script supplies its own binding: {command:?}"
+            );
+        }
+        for command in [
+            // The local shell expands a double-quoted script before ssh runs.
+            "ssh h \"T=$(mktemp -d); echo x > $T/s\"",
+            // A local binding never reaches the remote shell.
+            "T=$(mktemp -d); ssh h 'echo x > $T/s'",
+            // Options, remote argv words and dynamic destinations are outside
+            // the ownership proof, as they are for the heredoc receiver.
+            "ssh -p 22 h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh -o RemoteCommand=pwsh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h -- 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh $H 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h bash -c 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d); echo x > $T/s' extra",
+            "sudo ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "/tmp/ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh(){ pwsh -Command -; }; ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            // The remote values themselves must still be proven temporary.
+            "ssh h 'T=~/x; echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d /etc/v-XXXXXX); echo x > \"$T/p\"'",
+            "ssh h 'T=$(mktemp -u); echo x > \"$T\"'",
+        ] {
+            assert!(
+                embedded_bash_proven_redirect_offsets(command).is_empty(),
+                "uncertain source, owner or value cannot supply a remote proof: {command:?}"
+            );
+        }
+        for command in [
+            "ssh h 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"'",
+            "ssh h 'T=$(mktemp -d -p /tmp); echo x > \"$T/s\"'",
+            "ssh h 'D=$(mktemp -d); T=\"$D/sub\"; echo hi > \"$T/x\"'",
+            "/usr/bin/ssh h 'S=/tmp/sub; echo x > \"$S/out\"'",
+        ] {
+            let scope = NonlocalFilesystemScope::enter(true);
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem", "core.git"],
+                ShellDialect::Posix,
+            );
+            assert_eq!(
+                result.decision,
+                EvaluationDecision::Allow,
+                "{command:?}: {:?}",
+                result.pattern_info
+            );
+            assert!(NonlocalFilesystemScope::active());
+            drop(scope);
+            assert_eq!(default_posix_verdict(command), "Allow ", "{command:?}");
+        }
+        for command in [
+            "ssh h 'T=~/x; echo x > $T/s'",
+            "ssh h 'echo x > $HOME/.bashrc'",
+            "ssh h 'echo x > $X/s'",
+            "ssh h 'T=$(mktemp -d); echo x > $X/s'",
+            "ssh h \"T=$(mktemp -d); echo x > $T/s\"",
+            "T=$(mktemp -d); ssh h 'echo x > $T/s'",
+            "ssh h bash -c 'T=$(mktemp -d); echo x > $T/s'",
+            "ssh h 'T=$(mktemp -d /etc/v-XXXXXX); echo x > \"$T/p\"'",
+            "ssh h 'T=$(mktemp -u); echo x > \"$T\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/../../etc/passwd\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/.git/config\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/.ssh/authorized_keys\"'",
+            "ssh h 'T=$(mktemp -d); T=/etc; echo x > \"$T/passwd\"'",
+            "ssh h 'false && T=$(mktemp -d); echo x > \"$T/s\"'",
+            "ssh h 'if false; then T=$(mktemp -d); fi; echo x > \"$T/s\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; echo y > \"$OTHER\"'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; echo y > ~/new-note'",
+            "ssh h 'T=$(mktemp -d); echo x > \"$T/s\"; git reset --hard'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem", "core.git"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "complete evaluation must keep remote denials: {command:?}"
+            );
+            assert!(
+                default_posix_verdict(command).starts_with("Deny "),
+                "{command:?}"
+            );
+        }
+    }
+
     #[test]
     fn heredoc_bindings_cannot_prove_outer_redirects_issue_526() {
         for command in [
@@ -41131,6 +44244,42 @@ mod tests {
                 "core.git",
                 "reset-hard",
             ),
+            (
+                "g='git reset --hard'; $g",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
+            (
+                "g=git\\ reset; ${g} --hard",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
+            (
+                "g='git clean -fd'; $g",
+                &["core.git"][..],
+                "core.git",
+                "clean-force",
+            ),
+            (
+                "g='git push'; $g --force",
+                &["core.git"][..],
+                "core.git",
+                "push-force-long",
+            ),
+            (
+                "g=''; $g git reset --hard",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
+            (
+                "g=; ${g} git reset --hard",
+                &["core.git"][..],
+                "core.git",
+                "reset-hard",
+            ),
         ];
         for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
             for (command, packs, expected_pack, expected_rule) in cases {
@@ -41192,6 +44341,266 @@ mod tests {
                 "dynamic assignment must retain fail-closed behavior ({dialect:?})"
             );
         }
+    }
+
+    #[test]
+    fn executable_assignment_expansion_preserves_shell_argument_boundaries_540() {
+        for (command, expected) in [
+            ("X='git reset --hard'; $X", "'git' 'reset' '--hard'"),
+            ("X=git\\ reset\\ --hard; $X", "'git' 'reset' '--hard'"),
+            ("X='git reset'; ${X} --hard", "'git' 'reset' --hard"),
+            ("X='git reset --hard'; \"$X\"", "'git reset --hard'"),
+            ("X=''; $X git reset --hard", " git reset --hard"),
+            ("X=; \"$X\" git reset --hard", "'' git reset --hard"),
+            (
+                "X='echo ; git reset --hard'; $X",
+                "'echo' ';' 'git' 'reset' '--hard'",
+            ),
+            (
+                "X='echo $(git reset --hard)'; $X",
+                "'echo' '$(git' 'reset' '--hard)'",
+            ),
+            ("X='git\treset\n--hard'; $X", "'git' 'reset' '--hard'"),
+            ("X='git\rreset\u{b}--hard'; $X", "'git\rreset\u{b}--hard'"),
+            ("X='git\u{a0}reset'; $X", "'git\u{a0}reset'"),
+            ("IFS=''; X='git reset'; $X", "'git reset'"),
+            ("IFS=:; X='git reset'; \"$X\"", "'git reset'"),
+        ] {
+            let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+            let [ModeledPosixExecutableInvocation::Resolved(invocation)] =
+                model.invocations.as_slice()
+            else {
+                panic!("expected one proven invocation: {command}: {model:?}");
+            };
+            assert_eq!(invocation.command, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn executable_assignment_expansion_keeps_inert_values_inert_540() {
+        for command in [
+            "X='git reset --hard'; \"$X\"",
+            "X='/opt/tools/git reset --hard'; \"${X}\"",
+            "X=''; \"$X\" git reset --hard",
+            "X='git reset --hard'; printf '%s' \"$X\"",
+            "X='echo ; git reset --hard'; $X",
+            "X='echo $(git reset --hard)'; $X",
+            "X='echo `git reset --hard`'; $X",
+            "X='echo > /etc/profile'; $X",
+            "IFS=''; X='git reset --hard'; $X",
+            "X=git; $X status; $X diff",
+            "X=printf; $X '%s' safe; $X '%s' done",
+            "X=echo; Y=printf; $Y '>/dev/null' -v X git; $X 'git reset --hard'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_allowed(), "{command}: {:?}", result.pattern_info);
+        }
+    }
+
+    #[test]
+    fn executable_assignment_ifs_and_pathname_uncertainty_never_supply_masks_540() {
+        for command in [
+            "IFS=:; X='git:reset:--hard'; $X",
+            "IFS=$CUSTOM; X='git reset --hard'; $X",
+            "IFS=''; IFS=:; X='git:reset:--hard'; $X",
+            "X='g*'; $X reset --hard",
+            "X=g*; $X reset --hard",
+            "X='gi?'; $X reset --hard",
+            "X='gi[t]'; $X reset --hard",
+            "IFS=''; X='g*'; $X reset --hard",
+        ] {
+            let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+            assert!(
+                matches!(
+                    model.invocations.as_slice(),
+                    [ModeledPosixExecutableInvocation::Unverified { .. }]
+                ),
+                "{command}: {model:?}"
+            );
+            assert!(
+                model.inert_ranges.is_empty(),
+                "unproven source remains visible: {command}"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            let info = result
+                .pattern_info
+                .expect("uncertain executable carries a rule");
+            assert!(result.decision == EvaluationDecision::Deny, "{command}");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"), "{command}");
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some("executable-unverified"),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "IFS=:; IFS=' \t\n'; X='git reset --hard'; $X",
+            "IFS=$CUSTOM; IFS=$' \\t\\n'; X='git reset --hard'; $X",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "restored default IFS exposes Git: {command}"
+            );
+            assert_eq!(
+                result.pattern_info.and_then(|info| info.pattern_name),
+                Some("reset-hard".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn executable_assignment_state_cannot_survive_parent_shell_mutators_540() {
+        for command in [
+            "X=echo; Y=eval; $Y 'X=git'; $X reset --hard",
+            "X=echo; Y=printf; $Y -v X git; $X reset --hard",
+            "X=echo; Y=printf; $Y >/dev/null -v X git; $X reset --hard",
+            "X=echo; Y=printf; $Y > /dev/null -v X git; $X reset --hard",
+            "X=echo; Y=printf; $Y -v 2>/dev/null X git; $X reset --hard",
+            "X=echo; Y=read; $Y X; $X reset --hard",
+            "X='git:reset:--hard'; Y=eval; $Y 'IFS=:'; $X",
+            "X=; IFS=${X:=git}; \"$X\" reset --hard",
+        ] {
+            let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+            assert!(
+                matches!(
+                    model.invocations.last(),
+                    Some(ModeledPosixExecutableInvocation::Unverified { .. })
+                ),
+                "{command}: {model:?}"
+            );
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "a stale executable binding must not grant an allow: {command}"
+            );
+        }
+        let command = "X=echo; Y=eval; $Y 'X=git'; IFS=' \t\n'; X=git; $X status";
+        let model = model_literal_posix_executable_assignments(command, ShellDialect::Posix);
+        assert!(
+            model.invocations.iter().all(|invocation| matches!(
+                invocation,
+                ModeledPosixExecutableInvocation::Resolved(_)
+            )),
+            "fresh literal assignments restore proof: {model:?}"
+        );
+        let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+        assert!(
+            result.is_allowed(),
+            "fresh safe binding: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
+    fn executable_assignment_limits_are_findings_only_at_executable_uses_540() {
+        use std::fmt::Write as _;
+
+        let large = "x".repeat(MAX_POSIX_EXECUTABLE_VALUE_BYTES + 1);
+        let data = format!("X='{large}'; printf '%s' \"$X\"");
+        let model = model_literal_posix_executable_assignments(&data, ShellDialect::Posix);
+        assert!(model.invocations.is_empty());
+        assert!(model.inert_ranges.is_empty());
+
+        let many_fields = "field ".repeat(MAX_POSIX_EXECUTABLE_FIELDS + 1);
+        for command in [format!("X='{large}'; $X"), format!("X='{many_fields}'; $X")] {
+            let model = model_literal_posix_executable_assignments(&command, ShellDialect::Posix);
+            assert!(
+                matches!(
+                    model.invocations.as_slice(),
+                    [ModeledPosixExecutableInvocation::Unverified { .. }]
+                ),
+                "{model:?}"
+            );
+            assert!(model.inert_ranges.is_empty());
+        }
+
+        let mut assignments = String::new();
+        for index in 0..=MAX_POSIX_EXECUTABLE_BINDINGS {
+            write!(assignments, "X{index}=git; ").expect("append assignment");
+        }
+        let data = format!("{assignments}printf '%s' \"$X0\"");
+        assert!(
+            model_literal_posix_executable_assignments(&data, ShellDialect::Posix)
+                .invocations
+                .is_empty()
+        );
+        let command = format!("{assignments}$X0 reset --hard");
+        assert!(matches!(
+            model_literal_posix_executable_assignments(&command, ShellDialect::Posix)
+                .invocations
+                .as_slice(),
+            [ModeledPosixExecutableInvocation::Unverified { .. }]
+        ));
+
+        let padding = "Y=0; ".repeat(MAX_POSIX_EXECUTABLE_SEGMENTS);
+        let command = format!("X='git reset --hard'; $X; {padding}printf done");
+        let model = model_literal_posix_executable_assignments(&command, ShellDialect::Posix);
+        assert!(
+            matches!(
+                model.invocations.first(),
+                Some(ModeledPosixExecutableInvocation::Resolved(_))
+            ),
+            "a bounded tail cannot erase earlier evidence: {model:?}"
+        );
+        let allowed = project_allowlists_for_rule(
+            "heredoc.posix:executable-unverified",
+            "reviewed analysis boundary",
+        );
+        let result =
+            evaluate_with_pack_ids_and_allowlists_at_path(&command, &["core.git"], &allowed, None);
+        assert!(result.is_denied());
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("reset-hard".to_string())
+        );
+    }
+
+    #[test]
+    fn executable_assignment_rules_and_grants_keep_their_scope_540() {
+        let command = "X='git reset --hard'; $X";
+        let allowed = project_allowlists_for_rule("core.git:reset-hard", "reviewed Git reset");
+        assert!(
+            evaluate_with_pack_ids_and_allowlists_at_path(command, &["core.git"], &allowed, None)
+                .is_allowed()
+        );
+        let unrelated = project_allowlists_for_rule("core.git:clean-force", "different operation");
+        assert!(
+            evaluate_with_pack_ids_and_allowlists_at_path(command, &["core.git"], &unrelated, None)
+                .is_denied()
+        );
+
+        let uncertain = project_allowlists_for_rule(
+            "heredoc.posix:executable-unverified",
+            "reviewed executable assembly",
+        );
+        let result = evaluate_with_pack_ids_and_allowlists_at_path(
+            "IFS=:; X='git:status'; $X; git reset --hard",
+            &["core.git"],
+            &uncertain,
+            None,
+        );
+        assert!(result.is_denied());
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("reset-hard".to_string())
+        );
+
+        let command = "FLOWCTL='bash -c'; $FLOWCTL gate check --command 'npm test'";
+        let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+        assert!(result.is_denied());
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("inline-launcher-unverified".to_string())
+        );
     }
 
     /// `core.filesystem:credential-file-write` runs ahead of the redirect
@@ -42344,37 +45753,97 @@ mod tests {
         );
     }
 
-    /// #382: `heredoc.shell:launcher-unverified` fired on a QUOTED heredoc
-    /// piped to a non-shell interpreter reading stdin. A Markdown fenced block
-    /// in the body puts a backtick at the start of a segment, and the
-    /// unresolved-substitution scan cannot rule out that the segment assembles
-    /// `powershell`, so it failed closed. With a quoted delimiter the outer
-    /// shell performs no expansion, and a proven non-shell receiver does not
-    /// run the body as shell either, so no shell anywhere sees those bytes as
-    /// syntax and the finding is withdrawn — for that shape only.
+    /// #382: Markdown inside a language string literal must not become an
+    /// outer-shell launcher finding in a quoted interpreter heredoc. The body
+    /// still needs its language-specific checks: raw Markdown is not valid
+    /// Python, and Ruby/Perl backticks can execute even with a quoted delimiter.
     #[test]
     fn quoted_heredoc_into_non_shell_interpreter_is_not_a_shell_launcher() {
         const FENCED_BODY: &str = "```bash\nls\n```";
+        let python_body = format!("print(\"\"\"{FENCED_BODY}\"\"\")");
+        let ruby_body = format!("puts \"{FENCED_BODY}\"");
+        let perl_body = format!("print \"{FENCED_BODY}\";");
+        let php_body = format!("<?php echo \"{FENCED_BODY}\";");
 
-        for consumer in [
-            "python3 -",
-            "python -",
-            "ruby -",
-            "node -",
-            "perl -",
-            "php -",
-            "/usr/bin/python3 -",
-            "python3 script.py",
+        for (consumer, body) in [
+            ("python3 -", python_body.as_str()),
+            ("python -", python_body.as_str()),
+            ("ruby -", ruby_body.as_str()),
+            ("node -", "console.log(\"```bash\\nls\\n```\");"),
+            ("perl -", perl_body.as_str()),
+            ("php -", php_body.as_str()),
+            ("/usr/bin/python3 -", python_body.as_str()),
         ] {
-            let command = format!("{consumer} <<'PY'\n{FENCED_BODY}\nPY\n");
+            let command = format!("{consumer} <<'PY'\n{body}\nPY\n");
             for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
                 let result =
                     evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
                 assert!(
                     result.is_allowed(),
-                    "inert Markdown in a quoted heredoc to {consumer:?} ({dialect:?}) \
-                     must not read as shell launcher assembly: {:?}",
-                    result.pattern_info
+                    "a Markdown literal in a quoted heredoc to {consumer:?} ({dialect:?}) \
+                     must not read as shell launcher assembly: {result:?}"
+                );
+            }
+        }
+
+        // The former positive fixture was raw Markdown, not Python source.
+        // The bounded interpreter-literal parser reports a grammar error;
+        // that incomplete analysis is Indeterminate, not Allow, and it is
+        // not a budget overrun.
+        for consumer in ["python3 -", "python -", "/usr/bin/python3 -"] {
+            let command = format!("{consumer} <<'PY'\n{FENCED_BODY}\nPY\n");
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_indeterminate() && !result.skipped_due_to_budget,
+                    "invalid Python must remain unverified: {consumer:?} ({dialect:?}): {result:?}"
+                );
+            }
+        }
+        // For an opaque script consumer the body is stdin DATA that the
+        // script may hand to a shell, so the layers that judge such data run
+        // too (the valid-Python control below is denied outright). The
+        // literal-recovery grammar error no longer pre-empts them (#565): the
+        // verdict is never an allow, and a later finding may deny.
+        let command = format!("python3 script.py <<'PY'\n{FENCED_BODY}\nPY\n");
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_indeterminate() || result.is_denied(),
+                "invalid Python fed to an opaque script must stay blocked ({dialect:?}): {result:?}"
+            );
+        }
+
+        // A script file is an opaque consumer of stdin, not a proven program
+        // supplied by this heredoc. It cannot use the documentation proof.
+        let command = format!("python3 script.py <<'PY'\n{python_body}\nPY\n");
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+            assert!(result.is_denied(), "{dialect:?}: {result:?}");
+            let info = result.pattern_info.expect("denial has a rule");
+            assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+            assert_eq!(
+                info.pattern_name.as_deref(),
+                Some("substitution-unverified")
+            );
+        }
+
+        // Quoting the outer delimiter does not disable host-language sinks.
+        for (consumer, pack_id) in [("ruby -", "heredoc.ruby"), ("perl -", "heredoc.perl")] {
+            let command = format!("{consumer} <<'CODE'\n`rm -rf ~/data`;\nCODE\n");
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "host-language backticks execute: {consumer:?} ({dialect:?}): {result:?}"
+                );
+                let info = result.pattern_info.expect("denial has a rule");
+                assert_eq!(info.pack_id.as_deref(), Some(pack_id));
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some("backticks.rm_rf_catastrophic")
                 );
             }
         }
@@ -42418,16 +45887,23 @@ mod tests {
             }
         }
 
-        // The quoted-delimiter exemption covers only the body. A destructive
-        // command chained after the terminator is still evaluated.
-        let command = format!("python3 - <<'PY'\n{FENCED_BODY}\nPY\nrm -rf ~/data\n");
-        let result =
-            evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], ShellDialect::Posix);
-        assert!(
-            result.is_denied(),
-            "a command chained after the heredoc terminator must still be evaluated: {:?}",
-            result.pattern_info
-        );
+        // The quoted-delimiter exemption covers only the body. Use valid
+        // Python comments so this control reaches the actual chained delete,
+        // rather than stopping on malformed source or an unverified literal.
+        let harmless = "python3 - <<'PY'\n# ```bash\n# ls\n# ```\nprint(\"safe\")\nPY\n";
+        let command = format!("{harmless}rm -rf ~/data\n");
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let safe = evaluate_with_pack_ids_in_dialect(harmless, &["core.filesystem"], dialect);
+            assert!(safe.is_allowed(), "{dialect:?}: {safe:?}");
+            let result = evaluate_with_pack_ids_in_dialect(&command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_denied(),
+                "a command chained after the terminator must still be evaluated: {result:?}"
+            );
+            let info = result.pattern_info.expect("denial has a rule");
+            assert_eq!(info.pack_id.as_deref(), Some("core.filesystem"));
+            assert_eq!(info.pattern_name.as_deref(), Some("rm-rf-root-home"));
+        }
 
         // …and only a proven non-shell receiver qualifies: an unknown name
         // (a wrapper script, `busybox`, …) may well be a shell.
@@ -42442,6 +45918,29 @@ mod tests {
             "an unrecognized receiver must keep the fail-closed treatment: {:?}",
             result.pattern_info
         );
+    }
+
+    /// #560: a quoted delimiter stops only the OUTER shell's expansion. A
+    /// shell receiver runs the body as a program, so a substitution in it
+    /// executes and must keep its own rule, even though the outer-command
+    /// substitution enumeration (correctly) reports nothing for that body.
+    #[test]
+    fn quoted_shell_heredoc_substitution_is_still_evaluated_560() {
+        for command in [
+            "bash <<'SH'\necho $(git reset --hard)\nSH",
+            "sh <<'SH'\necho $(git reset --hard)\nSH",
+            "zsh <<\"SH\"\necho `git reset --hard`\nSH",
+            "bash <<-'SH'\n\techo $(git reset --hard)\n\tSH",
+            "cat <<'SH' | bash\necho $(git reset --hard)\nSH",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &["core.git"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "a shell runs this body: {command:?} ({dialect:?}): {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -44428,6 +47927,112 @@ mod tests {
         }
     }
 
+    /// #569: a Windows filesystem pass that stops at its size or statement
+    /// bound reports the configured incomplete-analysis outcome
+    /// (`Indeterminate`) instead of a `windows-filesystem-semantic-unverified`
+    /// finding it never made, while a visible destructive spelling still
+    /// denies under its own rule. A caller-proven POSIX command is not judged
+    /// by the Windows pack at all, even when the pack is enabled.
+    #[test]
+    fn issue_569_windows_filesystem_bound_is_incomplete_analysis_not_a_finding() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = [
+            "del",
+            "erase",
+            "rd",
+            "rmdir",
+            "format",
+            "Remove-Item",
+            "ri",
+            "rm",
+            "Clear-Content",
+            "Clear-RecycleBin",
+        ];
+        let ordered_packs = ["windows.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        let evaluate = |command: &str,
+                        dialect: ShellDialect,
+                        index: Option<&crate::packs::EnabledKeywordIndex>| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                index,
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+            )
+        };
+
+        let statements = "Write-Output 'rm x'; ".repeat(140);
+        // The generator from the issue at the first failing size. Its `^`
+        // after `(x|y)` and the `ri` inside `print` are what select the pass.
+        let tuples = " ('a', 'b'), ('c', 'd'),\n".repeat(29);
+        let python = format!(
+            "python3 - <<'EOF'\nimport re\ns = 'text'\nR = [\n{tuples}]\nfor m in re.finditer(r'[^\\n]{{0,40}}(x|y)[^\\n]{{0,40}}', s):\n    print(m.group(0))\nEOF"
+        );
+
+        for index in [None, keyword_index.as_ref()] {
+            for (command, dialect) in [
+                (statements.as_str(), ShellDialect::PowerShell),
+                (statements.as_str(), ShellDialect::Unknown),
+                // Where the pack is on and the dialect is Unknown — a Windows
+                // host, which keeps interpreter source as Windows evidence.
+                (python.as_str(), ShellDialect::Unknown),
+            ] {
+                let result = evaluate(command, dialect, index);
+                assert_eq!(
+                    result.decision,
+                    EvaluationDecision::Indeterminate,
+                    "{dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+                assert!(
+                    result.pattern_info.is_none(),
+                    "an incomplete analysis names no rule: {:?}",
+                    result.pattern_info
+                );
+            }
+
+            for dialect in [ShellDialect::PowerShell, ShellDialect::Unknown] {
+                let command = format!("{statements}Clear-Content C:\\important.conf");
+                let result = evaluate(&command, dialect, index);
+                assert!(
+                    result.is_denied(),
+                    "{dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some("clear-content"),
+                    "{dialect:?}; index={}",
+                    index.is_some()
+                );
+            }
+
+            let result = evaluate(&python, ShellDialect::Posix, index);
+            assert!(
+                result.is_allowed(),
+                "index={}: {:?}",
+                index.is_some(),
+                result.pattern_info
+            );
+        }
+    }
+
     #[test]
     fn powershell_non_database_syntax_is_not_claimed_by_indirect_input_guard() {
         use crate::normalize::ShellDialect;
@@ -45088,6 +48693,137 @@ mod tests {
         }
     }
 
+    #[test]
+    fn python_inline_source_guard_respects_option_ownership() {
+        for command in [
+            r#"python3 -c "$SCRIPT""#,
+            "python3 -c $SCRIPT",
+            r#"/usr/bin/python3.11 -Iu -c "${SCRIPT}""#,
+            r#"python3 -Iuc "$SCRIPT""#,
+            r#"python3 -Ic"$SCRIPT""#,
+            r#"python3 '-I' '-c' "$SCRIPT""#,
+            r#"python3 -W ignore -c "$SCRIPT""#,
+            r#"python3 -Wignore -c "$SCRIPT""#,
+            r#"python3 -bW '-c' -c "$SCRIPT""#,
+            r#"python3 -X utf8 -c "$SCRIPT""#,
+            r#"python3 -Xutf8 -c "$SCRIPT""#,
+            r#"python3 --check-hash-based-pycs default -c "$SCRIPT""#,
+            r#"python3 -c "$(cat script.py)""#,
+            r#"python3 -c "`cat script.py`""#,
+        ] {
+            let parsed = parse_obfuscated_posix_inline_launcher_segment(
+                command,
+                MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES,
+            );
+            assert!(
+                matches!(parsed, PosixInlineLauncherParse::Unverified(ref reason)
+                    if reason.starts_with("Python inline source")),
+                "a real Python source operand must reach its dynamic guard: {command}: {parsed:?}"
+            );
+        }
+
+        for command in [
+            r"python3 -c '$SCRIPT'",
+            r#"python3 -c "\$SCRIPT""#,
+            r"python3 -c \$SCRIPT",
+            r#"python3 -c 'print("$SCRIPT")'"#,
+            r#"python3 -c "print('$SCRIPT')""#,
+            r#"python3 script.py -c "$SCRIPT""#,
+            r#"python3 -m example -c "$SCRIPT""#,
+            r#"python3 -mexample -c "$SCRIPT""#,
+            r#"python3 -c pass -c "$SCRIPT""#,
+            r#"python3 -cpass -c "$SCRIPT""#,
+            r#"python3 - -c "$SCRIPT""#,
+            r#"python3 -- -c "$SCRIPT""#,
+            r#"python3 -V -c "$SCRIPT""#,
+            r#"python3 -h -c "$SCRIPT""#,
+            r#"python3 --help-all -c "$SCRIPT""#,
+            r#"python3 -e "$SCRIPT""#,
+            r#"python3 --unknown -c "$SCRIPT""#,
+            r#"python3 -W '-c' "$SCRIPT""#,
+            r#"python3 -X '-c' "$SCRIPT""#,
+            r#"python3 -Wignorec "$SCRIPT""#,
+            r#"python3 -W $FILTER -c "$SCRIPT""#,
+            r#"python3 -W* -c "$SCRIPT""#,
+            r#"python3 -c "$(printf pass)""#,
+            r#"python3 -c "`printf pass`""#,
+            r#"python3 -c "$((1 + 2))""#,
+            r#"node -e "$SCRIPT""#,
+            r#"perl -e "$SCRIPT""#,
+        ] {
+            assert_eq!(
+                parse_obfuscated_posix_inline_launcher_segment(
+                    command,
+                    MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES,
+                ),
+                PosixInlineLauncherParse::NotLauncher,
+                "literal source, script argv or unsupported ownership must retain its prior route: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_inline_source_guard_preserves_literal_marker_data() {
+        let marker = crate::packs::core::git::POSIX_DYNAMIC_QUOTED;
+        let quoted_marker = format!("'{marker}'");
+        let words = ["python3", "-c", quoted_marker.as_str()];
+        assert!(!python_inline_source_is_wholly_dynamic(
+            &words, &words, false
+        ));
+        assert!(!posix_word_is_wholly_dynamic_python_source(
+            r#""'$SCRIPT'""#
+        ));
+        assert!(!posix_word_is_wholly_dynamic_python_source(
+            r"$'\x24SCRIPT'"
+        ));
+    }
+
+    #[test]
+    fn wholly_dynamic_python_inline_source_keeps_allowlist_ownership() {
+        let command = r#"python3 -c "$SCRIPT""#;
+        let denied = evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+        assert!(denied.is_denied(), "{:?}", denied.pattern_info);
+        let info = denied
+            .pattern_info
+            .expect("dynamic source has an owning rule");
+        assert_eq!(info.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("inline-launcher-unverified")
+        );
+
+        let allowlists = project_allowlists_for_rule(
+            "heredoc.posix:inline-launcher-unverified",
+            "reviewed Python source provider",
+        );
+        let allowed = evaluate_with_pack_ids_and_allowlists_at_path(
+            command,
+            &["core.git"],
+            &allowlists,
+            None,
+        );
+        assert!(allowed.is_allowed(), "{:?}", allowed.pattern_info);
+        let grant = allowed
+            .allowlist_override
+            .expect("owning grant is reported");
+        assert_eq!(grant.matched.pack_id.as_deref(), Some("heredoc.posix"));
+        assert_eq!(
+            grant.matched.pattern_name.as_deref(),
+            Some("inline-launcher-unverified")
+        );
+
+        let sibling = evaluate_with_pack_ids_and_allowlists_at_path(
+            &format!("{command}; git reset --hard"),
+            &["core.git"],
+            &allowlists,
+            None,
+        );
+        assert!(sibling.is_denied(), "{:?}", sibling.pattern_info);
+        let info = sibling.pattern_info.expect("independent Git denial");
+        assert_eq!(info.pack_id.as_deref(), Some("core.git"));
+        assert_eq!(info.pattern_name.as_deref(), Some("reset-hard"));
+    }
+
     /// A shell `-c` script that is wholly an expansion or substitution runs
     /// source dcg never sees, like `eval "$X"`. It used to pass the keyword
     /// pre-filter untouched, so `x='rm -rf ~'; bash -c "$x"` was allowed.
@@ -45166,6 +48902,268 @@ mod tests {
             None,
         );
         assert!(result.is_allowed(), "{:?}", result.pattern_info);
+    }
+
+    /// `command`'s decision and rule under the default pack set, in the POSIX
+    /// dialect the Bash hook uses, as `"<decision> <pack>:<rule>"`.
+    fn default_posix_verdict(command: &str) -> String {
+        let enabled = default_config().enabled_pack_ids();
+        let pack_ids: Vec<&str> = enabled.iter().map(String::as_str).collect();
+        let result = evaluate_with_pack_ids_in_dialect(command, &pack_ids, ShellDialect::Posix);
+        let rule = result
+            .pattern_info
+            .as_ref()
+            .map_or_else(String::new, |info| {
+                format!(
+                    "{}:{}",
+                    info.pack_id.as_deref().unwrap_or_default(),
+                    info.pattern_name.as_deref().unwrap_or_default()
+                )
+            });
+        format!("{:?} {rule}", result.decision)
+    }
+
+    /// Asserts that every launcher spelling of a row gets exactly the
+    /// verdict its payload text gets at top level, and that the top-level
+    /// verdict is `expected`. Prints the whole table before asserting, so a
+    /// failing run still shows every row.
+    fn assert_payloads_match_top_level(rows: &[(&str, &[&str])], expected: &str) {
+        let mut mismatches = Vec::new();
+        for (text, payloads) in rows {
+            let top = default_posix_verdict(text);
+            eprintln!("551 | top     | {text:?} | {top}");
+            if top.trim_end() != expected {
+                mismatches.push(format!("top-level {text:?}: {top} (expected {expected})"));
+            }
+            for payload in *payloads {
+                let nested = default_posix_verdict(payload);
+                eprintln!("551 | payload | {payload:?} | {nested}");
+                if nested != top {
+                    mismatches.push(format!("{payload:?}: {nested} != top-level {top}"));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// #551: an inline script gets the verdict its text gets at top level,
+    /// whatever unrelated words it contains. Recursion into a `bash -c`,
+    /// `sh -c`, `ssh` or `bash <<EOF` body was gated on some pack keyword
+    /// appearing in it, while the top-level quick reject also forces the
+    /// keyword-less dynamic-executable check. So `$G -D main` was denied as
+    /// `core.git:branch-dynamic-token` but `bash -c '$G -D main'` was
+    /// allowed, and an unrelated `ln` (or `xlnx`, a substring) switched the
+    /// denial back on. The first ten rows are the issue's table.
+    #[test]
+    fn inline_payloads_get_their_top_level_denial_551() {
+        assert_payloads_match_top_level(
+            &[
+                (
+                    "$G -D main",
+                    &[
+                        "bash -c '$G -D main'",
+                        "sh -c '$G -D main'",
+                        "zsh -c '$G -D main'",
+                        "fish -c '$G -D main'",
+                        "ssh h '$G -D main'",
+                        "bash <<'EOF'\n$G -D main\nEOF",
+                        "bash <<< '$G -D main'",
+                    ],
+                ),
+                (
+                    "$p = x -d 1",
+                    &["bash -c '$p = x -d 1'", "ssh h '$p = x -d 1'"],
+                ),
+                ("$p = x -d 1; $q.Name", &["ssh h '$p = x -d 1; $q.Name'"]),
+                (
+                    "$p = x -d 1; $q.FullName",
+                    &["ssh h '$p = x -d 1; $q.FullName'"],
+                ),
+                ("$p = x -d 1; ln", &["bash -c '$p = x -d 1; ln'"]),
+                ("$p = x -d 1; xlnx", &["bash -c '$p = x -d 1; xlnx'"]),
+                ("$p = x -d 1; xl nx", &["bash -c '$p = x -d 1; xl nx'"]),
+                (
+                    "$p = x -d 1; echo git",
+                    &["bash -c '$p = x -d 1; echo git'"],
+                ),
+                ("$p -d 1", &["bash -c '$p -d 1'"]),
+                ("$p -d 1; ln", &["bash -c '$p -d 1; ln'"]),
+                // Keyword-less shapes whose top-level reading reaches the
+                // same rule through control flow or a deferred body.
+                (
+                    "for i in 1; do $G -D main; done",
+                    &["bash -c 'for i in 1; do $G -D main; done'"],
+                ),
+                (
+                    "if true; then $G -D main; fi",
+                    &["bash -c 'if true; then $G -D main; fi'"],
+                ),
+                (
+                    "alias x='$G -D main'",
+                    &["bash <<'EOF'\nalias x='$G -D main'\nEOF"],
+                ),
+                (
+                    "trap '$G -D main' EXIT",
+                    &["bash <<'EOF'\ntrap '$G -D main' EXIT\nEOF"],
+                ),
+                (
+                    "x=$(cat f); $x -D main",
+                    &["bash -c 'x=$(cat f); $x -D main'"],
+                ),
+                // A here-string body is also read as Bash whatever its
+                // receiver (see `evaluate_heredoc`), as it already was when
+                // the body held a keyword; a data-sink receiver stays exempt.
+                ("$a -d $b", &["mytool <<< \"$a -d $b\""]),
+            ],
+            "Deny core.git:branch-dynamic-token",
+        );
+        // `eval` of a dynamic value carries no pack keyword either: inside
+        // `sh -c` it ran unchecked while the same text is denied.
+        assert_payloads_match_top_level(
+            &[
+                ("eval \"$X\"", &["sh -c 'eval \"$X\"'"]),
+                (
+                    "eval $(cat)",
+                    &["sh -c 'eval $(cat)'", "bash -c 'eval $(cat)'"],
+                ),
+            ],
+            "Deny heredoc.posix:eval-dynamic",
+        );
+    }
+
+    /// #551, other direction: keyword-less payloads that are allowed at top
+    /// level stay allowed inside a launcher. `G=echo; $G -D main` is the
+    /// sharpest: its executable is resolved from the assignment before it,
+    /// a proof only the whole script carries.
+    #[test]
+    fn inline_payloads_keep_their_top_level_allow_551() {
+        assert_payloads_match_top_level(
+            &[
+                ("echo hi", &["bash -c 'echo hi'", "ssh h 'echo hi'"]),
+                ("echo $X", &["bash -c 'echo $X'"]),
+                (
+                    "$CMD --help",
+                    &[
+                        "bash -c '$CMD --help'",
+                        "bash -c \"$CMD --help\"",
+                        "ssh h '$CMD --help'",
+                    ],
+                ),
+                ("$X $Y", &["bash -c '$X $Y'"]),
+                ("cd $D && make", &["bash -c 'cd $D && make'"]),
+                ("G=echo; $G -D main", &["bash -c 'G=echo; $G -D main'"]),
+                (
+                    "echo '$G -D main'",
+                    &["bash <<'EOF'\necho '$G -D main'\nEOF"],
+                ),
+                (
+                    "$line",
+                    &["read -r a b <<< \"$line\"", "jq . <<< \"$line\""],
+                ),
+            ],
+            "Allow",
+        );
+
+        // A data sink never runs its stdin, so a body whose text is denied
+        // as a command stays allowed there.
+        for command in ["cat <<'EOF'\n$X -d 1\nEOF", "grep x <<< \"$a -d $b\""] {
+            assert_eq!(default_posix_verdict(command), "Allow ", "{command:?}");
+        }
+    }
+
+    /// #576: a verified literal shell script keeps the literal-temp exemption
+    /// its text gets at top level. The outer command still holds the script's
+    /// bytes, and the recursive-rm regexes matched `rm -rf /` in them
+    /// (`core.filesystem:rm-rf-root-home`), because the core rm parser that
+    /// grants the exemption sees only `sh` as that segment's executable.
+    /// Prints every row before asserting.
+    #[test]
+    fn literal_temp_cleanup_scripts_keep_their_top_level_allow_issue_576() {
+        let mut mismatches = Vec::new();
+        for text in [
+            "rm -rf /tmp/probe",
+            "rm -rf /var/tmp/probe",
+            "rm -r /tmp/probe",
+            "rm -fr /tmp/probe/child",
+            "rm -r -f -- /tmp/probe /var/tmp/other",
+            "rm --recursive --force /tmp/probe",
+            "rm -rf \"/var/tmp/quoted\"",
+        ] {
+            let top = default_posix_verdict(text);
+            eprintln!("576 | top    | {text:?} | {top}");
+            if top != "Allow " {
+                mismatches.push(format!("top-level {text:?}: {top}"));
+            }
+            for script in [
+                format!("sh -c '{text}'"),
+                format!("bash -c '{text}'"),
+                format!("dash -c '{text}'"),
+                format!("zsh -c '{text}'"),
+                format!("/bin/sh -c '{text}'"),
+                format!("ssh host '{text}'"),
+            ] {
+                let verdict = default_posix_verdict(&script);
+                eprintln!("576 | script | {script:?} | {verdict}");
+                if verdict != top {
+                    mismatches.push(format!("{script:?}: {verdict} != top-level {top}"));
+                }
+            }
+        }
+        // The core rule itself stands down; this is not only the AST policy.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "sh -c 'rm -rf /tmp/probe'",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        if !result.is_allowed() {
+            mismatches.push(format!("core.filesystem alone: {:?}", result.pattern_info));
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// #576, other direction: the exemption covers exactly one literal
+    /// cleanup of temp descendants in a script whose bytes reach the shell
+    /// unchanged. Roots, traversal, other operands, expansions, globs,
+    /// additional commands, outer commands and outer redirects keep a denial.
+    #[test]
+    fn inline_scripts_keep_recursive_rm_denials_issue_576() {
+        let mut allowed = Vec::new();
+        for command in [
+            "sh -c 'rm -rf /tmp'",
+            "sh -c 'rm -rf /tmp/'",
+            "sh -c 'rm -rf /var/tmp'",
+            "sh -c 'rm -rf /home/user/Documents'",
+            "sh -c 'rm -rf /tmp/../home/user'",
+            "sh -c 'rm -rf /tmp/probe/../../etc'",
+            "sh -c 'rm -rf -- -x /tmp/a'",
+            "sh -c 'rm -rf /tmp/a /home/user'",
+            "sh -c 'rm -rf / /tmp/a'",
+            "sh -c 'rm -rf /tmp/probe -rf /etc'",
+            "sh -c \"rm -rf /tmp/$X\"",
+            "sh -c 'rm -rf /tmp/$X'",
+            "sh -c 'rm -rf /tmp/*'",
+            "sh -c 'rm -rf /tmp/{a,../etc}'",
+            "bash -c 'rm -rf /tmp/probe $(rm -rf /)'",
+            "sh -c 'cd /; rm -rf tmp/probe'",
+            "sh -c 'rm -rf ~/tmp/probe'",
+            "sh -c 'rm -rf $HOME'",
+            "sh -c 'rm -rf /tmp/probe; rm -rf /'",
+            "sh -c 'rm -rf /tmp/probe && rm -rf ~'",
+            "sh -c 'rm -rf /tmp/probe\nrm -rf /'",
+            "sh -c 'rm -rf /tmp/probe' && rm -rf /",
+            "sh -c 'rm -rf /tmp/probe'; rm -rf ~",
+            "sh -c 'rm -rf /tmp/probe' > /etc/passwd",
+            "ssh host 'rm -rf /'",
+            "ssh host 'rm -rf /tmp'",
+            "ssh host 'rm -rf /tmp/probe /home/user'",
+        ] {
+            let verdict = default_posix_verdict(command);
+            eprintln!("576 | deny   | {command:?} | {verdict}");
+            if !verdict.starts_with("Deny ") {
+                allowed.push(format!("{command:?}: {verdict}"));
+            }
+        }
+        assert!(allowed.is_empty(), "{allowed:#?}");
     }
 
     /// dash, ksh and mksh are POSIX shells like sh/bash: their `-c` payload is
@@ -46299,6 +50297,7 @@ mod tests {
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -46487,6 +50486,7 @@ mod tests {
                 effective_mode: None,
                 skipped_due_to_budget: false,
                 quick_rejected: false,
+                regex_evaluation_incomplete: false,
                 session_occurrence: None,
                 graduated_response: None,
                 bypass_method: None,
@@ -47047,6 +51047,7 @@ mod tests {
                 delimiter: Some("PY".to_string()),
                 byte_range: 0..0,
                 content_range: None,
+                word_range: None,
                 quoted: true,
                 heredoc_type: Some(crate::heredoc::HeredocType::Standard),
                 target_command: Some("python3".to_string()),
@@ -47384,6 +51385,57 @@ mod tests {
                 result.is_allowed(),
                 "exceeded line limit should fail-open with default settings"
             );
+        }
+
+        #[test]
+        fn imported_python_rmtree_survives_incomplete_extraction() {
+            for (max_body_bytes, max_body_lines) in [(1024 * 1024, 1), (1, 10_000)] {
+                let settings = heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
+                    max_body_bytes,
+                    max_body_lines,
+                    max_heredocs: 10,
+                    timeout_ms: 5_000,
+                });
+                for body in [
+                    "from shutil import rmtree as wipe\nwipe('/tmp')",
+                    "from shutil import copy, rmtree as wipe\nwipe('/private/tmp/.')",
+                    "from shutil import (\n    copy,\n    rmtree as wipe,\n)\nwipe('/var/tmp')",
+                    "from shutil import (\n    copy, # another imported name\n    rmtree as wipe,\n)\nwipe('/private/var/tmp')",
+                    "from shutil import (\n    copy # another imported name\n    as cp,\n    rmtree as wipe,\n)\nwipe('/tmp')",
+                    "from shutil import (\n    copy as # another imported name\n    cp,\n    rmtree as wipe,\n)\nwipe('/tmp')",
+                    "from shutil \\\nimport rmtree as wipe\nwipe('/tmp/build/..')",
+                    "from shutil import *\nwipe = rmtree\nwipe('/tmp')",
+                ] {
+                    let command = format!("python3 - <<'PY'\n{body}\nPY");
+                    assert!(
+                        eval_with_heredoc(&command, &settings).is_denied(),
+                        "an imported recursive delete must retain protection after extraction is bounded: {command:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn imported_python_rmtree_fallback_preserves_unrelated_imports_and_data() {
+            let settings = heredoc_config_with_limits(crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 1,
+                max_heredocs: 10,
+                timeout_ms: 5_000,
+            });
+            for command in [
+                "cat <<'PY'\nfrom shutil import rmtree as wipe\nwipe('/tmp')\nPY",
+                "python3 - <<'PY'\nfrom project_helpers import cleanup as wipe\nwipe('/tmp')\nPY",
+                "python3 - <<'PY'\nfrom shutil import copy as rmtree\nprint('ok')\nPY",
+                "python3 - <<'PY'\nfrom shutil import (copy as rmtree, move)\nprint('ok')\nPY",
+                "python3 - <<'PY'\nfrom shutil import (\n    copy, # rmtree is not imported\n    move,\n)\nprint('ok')\nPY",
+                "python3 - <<'PY'\n# from shutil import rmtree as wipe\nprint('ok')\nPY",
+            ] {
+                assert!(
+                    eval_with_heredoc(command, &settings).is_allowed(),
+                    "the imported-delete signal must not classify unrelated imports or inert data as a delete: {command:?}"
+                );
+            }
         }
 
         /// #452: `check_fallback_patterns` is the only backstop that covers an
@@ -49012,6 +53064,297 @@ mod tests {
         }
     }
 
+    /// GitHub #552, end to end under the dialect the Claude Code `Bash` tool
+    /// declares. A quoted `&`, `;` or `|` is part of a file name: the move
+    /// between two `~/Downloads` paths is the same ordinary rename the
+    /// `mv-within-home` rescue already allowed with any other punctuation.
+    #[test]
+    fn mv_within_home_quoted_separators_end_to_end_posix_issue_552() {
+        for command in [
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ; b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a | b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a b.pdf" "/home/tester/Downloads/c & d.pdf""#,
+            r"mv '/home/tester/Downloads/a & b.pdf' '/home/tester/Downloads/c.pdf'",
+            r#"mv "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Kevin & Linh's Wedding - A Comprehensive Guide.pdf" "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Archive/""#,
+            r#"mv "a & b.pdf" /home/tester/Downloads/c.pdf"#,
+            // Controls from the report that were already allowed.
+            r#"mv "/home/tester/Downloads/a x b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ( b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/tmp/a & b.pdf" "/tmp/c.pdf""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "a quoted separator in a home-subtree mv operand is file-name data: \
+                 {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Real separators still end the mv, and every boundary still holds.
+        let deny_cases: [(&str, &[&str]); 9] = [
+            // The second segment is judged on its own.
+            ("mv ~/Downloads/a ~/Downloads/b; rm -rf ~", &[]),
+            (
+                r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf" && rm -rf ~"#,
+                &[],
+            ),
+            // A one-operand mv before `&` is not a home-subtree rename, and
+            // the backgrounded mv after it is the canonical bypass.
+            (
+                "mv ~/Downloads/a & mv /etc /tmp/x",
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf" & mv /etc /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            // Relocate-then-delete across segments, with a quoted `&` in the
+            // name being relocated.
+            (
+                r#"mv "/home/tester/Downloads/a & b.pdf" /tmp/x && rm -rf /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                "mv /etc /tmp/x && rm -rf /tmp/x",
+                &["mv-sensitive-source-root-home"],
+            ),
+            // Dotfile trees and `..` stay gated inside quotes.
+            (
+                r#"mv "/home/tester/Downloads/x" "/home/tester/.ssh""#,
+                &["mv-sensitive-source-root-home", "credential-file-write"],
+            ),
+            (
+                r#"mv "/home/tester/Downloads/a & b/../../.ssh/k" "/home/tester/Downloads/c""#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            // Escaped operands are never rescued: every in-path backslash is
+            // unverifiable to the mv rules (#356).
+            (
+                r"mv /home/tester/Downloads/a\ \&\ b.pdf /home/tester/Downloads/c.pdf",
+                &["mv-sensitive-source-root-home", "mv-dynamic-path"],
+            ),
+        ];
+        for (command, expected_rules) in deny_cases {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "the #552 fix must not widen the home-subtree rescue: {command:?}: {:?}",
+                result.pattern_info
+            );
+            let name = result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref())
+                .unwrap_or("<none>");
+            if expected_rules.is_empty() {
+                assert!(
+                    name.starts_with("rm-"),
+                    "expected the trailing rm segment to deny {command:?}, got {name}"
+                );
+            } else {
+                assert!(
+                    expected_rules.contains(&name),
+                    "unexpected deny rule for {command:?}: {name} \
+                     (expected one of {expected_rules:?})"
+                );
+            }
+        }
+    }
+
+    /// An unquoted brace list expands before mv runs, so it must not ride the
+    /// home-subtree rescues past their `..` and dotfile checks. Bash is the
+    /// dialect that expands it.
+    #[test]
+    fn mv_within_home_brace_expansion_end_to_end_posix() {
+        for command in [
+            "mv ~/{..,a}/{..,b}/etc ~/Documents/x",
+            "mv ~/{Documents,.ssh}/id_rsa ~/Documents/y",
+            "mv {..,a}/{..,b}/x /home/tester/Documents/y",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "brace expansion must not ride the home-subtree rescue: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        let result = evaluate_with_pack_ids_in_dialect(
+            r#"mv "/home/tester/Documents/{draft}.txt" "/home/tester/Documents/final.txt""#,
+            &["core.git", "core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "a quoted brace is literal file-name data: {:?}",
+            result.pattern_info
+        );
+    }
+
+    /// A quoted or escaped separator in an earlier operand hid every later
+    /// operand from the `core.filesystem` rules that scan one command with
+    /// `[^|;&]*` (#552 follow-up). The masked destructive pass reads past it
+    /// in both POSIX-grammar dialects; real separators still split.
+    #[test]
+    fn quoted_separator_cannot_hide_a_later_operand_end_to_end() {
+        let deny_cases: [(&str, &[&str]); 14] = [
+            (
+                r#"mv "a;b" ~/Documents /tmp/x; rm -rf /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv "a & b" /etc /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv "a & b" /home/tester /tmp/x && rm -rf /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"sudo mv "a & b" /etc /tmp/x"#,
+                &["mv-sensitive-source-root-home"],
+            ),
+            (
+                r#"mv 'a|b' "$HOME" /tmp/x"#,
+                &["mv-sensitive-source-root-home", "mv-dynamic-path"],
+            ),
+            (r#"mv "a & b" $X /tmp/y"#, &["mv-dynamic-path"]),
+            (
+                r#"find "a;b" / -delete"#,
+                &["find-delete-root-home", "find-delete-general"],
+            ),
+            (
+                r#"find "a;b" ~ -delete"#,
+                &["find-delete-root-home", "find-delete-general"],
+            ),
+            (
+                r"find a\;b / -delete",
+                &["find-delete-root-home", "find-delete-general"],
+            ),
+            (
+                r#"cp -a "a & b" /etc /tmp/x && rm -rf /tmp/x"#,
+                &["cp-sensitive-then-delete"],
+            ),
+            (
+                r#"ln -s "a & b" /etc /tmp/x && rm -rf /tmp/x/."#,
+                &["ln-symlink-sensitive-then-delete"],
+            ),
+            (
+                r#"rsync -a "a;b" /etc/ /tmp/d/ && rm -rf /tmp/d"#,
+                &["rsync-sensitive-then-delete"],
+            ),
+            (
+                r#"rsync -a --delete "a & b" /tmp/src/ /etc/"#,
+                &["rsync-delete-sensitive-dest"],
+            ),
+            (
+                r#"dd "if=a&b" of=/etc/hosts"#,
+                &["dd-overwrite-root-home", "dd-overwrite-general"],
+            ),
+        ];
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (command, expected_rules) in deny_cases {
+                let result = evaluate_with_pack_ids_in_dialect(
+                    command,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "a quoted separator must not hide a later operand ({dialect:?}): \
+                     {command:?}: {:?}",
+                    result.pattern_info
+                );
+                let name = result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref())
+                    .unwrap_or("<none>");
+                assert!(
+                    expected_rules.contains(&name),
+                    "unexpected deny rule for {command:?} ({dialect:?}): {name} \
+                     (expected one of {expected_rules:?})"
+                );
+            }
+        }
+
+        for command in [
+            r#"mv "a & b" c"#,
+            r#"mv "a;b" /tmp/x/"#,
+            r#"mv "/home/tester/Documents/a & b" ~/Documents/x ~/Documents/y"#,
+            r#"mv "a & b" /home/tester/Documents/y"#,
+            r#"cp -a "a & b" /tmp/x && rm -rf /tmp/x"#,
+            r#"rsync -a "a & b" /tmp/dst/"#,
+            r#"find . -name "a;b" -print"#,
+            r#"grep "a|b" file"#,
+            r#"echo "x;y" > /tmp/out"#,
+            r#"git commit -m "mv a; rm -rf /""#,
+            r"find /tmp/build -name x -exec rm {} \;",
+            r#"echo "$(cd /tmp; ls "a;b")""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "a quoted separator in a harmless command must stay data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// The Trash soft-delete dcg recommends reads a quoted `&` as a file-name
+    /// byte (#552), and an unquoted brace list no longer rides it past the
+    /// `..` guard.
+    #[test]
+    fn trash_rescue_quoted_separators_and_braces_end_to_end_posix() {
+        for command in [
+            r#"mv "/Users/u/Documents/Kevin & Linh's Wedding.pdf" ~/.Trash/"#,
+            r"mv '/home/u/docs/a;b.txt' /home/u/.local/share/Trash/",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "a quoted separator in a Trash move is file-name data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        for command in [
+            "mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/",
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/ && rm -rf ~"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "the Trash rescue must stay bounded: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
     #[test]
     fn nested_substitution_bindings_do_not_prove_outer_variables() {
         // A binding inside `$( )`, backticks, or `<( )` runs in a subshell;
@@ -49912,11 +54255,34 @@ mod tests {
                 "ruby <<'RB'\ngit branch $name\nRB",
                 "perl <<'PL'\ngit branch $name\nPL",
                 "cd /tmp/project && python3 - <<'PY'\ns = open('a.ts').read()\n# git branch $name\nopen('a.ts', 'w').write(s)\nPY",
+                "node - <<'JS'\n// git branch $(cat name)\nconsole.log(\"git branch $(cat name)\");\nJS",
             ] {
                 assert!(
                     !denied(command),
                     "no shell ever expands this body: {command:?}"
                 );
+            }
+            // Raw shell text is not a valid Python/JavaScript program. Once it
+            // carries a substitution marker, the #544 literal recovery cannot
+            // finish, and incomplete analysis never approves (fb60af1 made the
+            // matching #363/#382 shapes Indeterminate). That incompleteness
+            // must not be reported as a deny either.
+            for command in [
+                "node - <<'JS'\ngit branch $(cat name)\nJS",
+                "python3 <<'PY'\ngit branch $(cat name)\nPY",
+            ] {
+                for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                    let result = evaluate_with_pack_ids_in_dialect(
+                        command,
+                        &["core.git", "core.filesystem"],
+                        dialect,
+                    );
+                    assert!(
+                        result.is_indeterminate() && !result.skipped_due_to_budget,
+                        "unparseable program source is unverified, not a budget overrun: \
+                         {command:?} ({dialect:?}): {result:?}"
+                    );
+                }
             }
         }
 
@@ -49975,36 +54341,102 @@ mod tests {
             }
         }
 
-        /// #363: a `>` inside such a body is bytes handed to the interpreter,
-        /// not an outer-shell redirect, so the truncate rules stand down for
-        /// doc prose with `<x>` placeholders — while a real outer redirect,
-        /// or the same body under an unquoted delimiter, keeps the deny.
+        /// #363: a `>` in a quoted interpreter heredoc is not an outer-shell
+        /// redirect. Raw prose still needs valid interpreter syntax, and an
+        /// unquoted delimiter still executes the reported prose's backticks.
         #[test]
         fn placeholder_gt_in_quoted_interpreter_body_is_not_a_redirect_363() {
-            let reported = concat!(
-                "python3 - <<'PYEOF'\n",
+            let reported_body = concat!(
                 "- `DATA_DIR` resolves *inside each instance*: `~/.app/instances/<i>/store-data/` — sqlite `index.db` (+ `-wal`/`-shm`) plus `logs/`, `records/`, `blocks/`, `.meta/`, `.backup/`.\n",
                 "- Every instance's `gw.json` is identically `{\"search\": {\"bm25\": {\"language\": \"en\"}}}` — the **local** backend. No cloud block on any instance.\n",
                 "- The package DOES ship a Cloud client (`~/.app/plugins/vendor-plugin/src/core/store/client.ts`, wants `url`/`user`/`apiKey`, auth header `Bearer acct=x&api_key=y`) — but it is **dormant**. No url/user/apiKey exists in any instance `.env`, any gw config, or anywhere under `~/.app`.\n",
-                "PYEOF",
             );
-            assert!(
-                !denied(reported),
-                "the reported three-line doc body must be allowed"
-            );
+            let reported = format!("python3 - <<'PYEOF'\n{reported_body}PYEOF");
+            let unquoted_report = reported.replace("<<'PYEOF'", "<<PYEOF");
+            let quoted_literal =
+                format!("python3 - <<'PYEOF'\nprint(\"\"\"{reported_body}\"\"\")\nPYEOF");
+            let unquoted_literal = quoted_literal.replace("<<'PYEOF'", "<<PYEOF");
 
-            // The same placeholder text under an UNQUOTED delimiter is
-            // genuinely expanded/redirect-bearing shell as far as the outer
-            // shell is concerned; nothing here may weaken that.
-            let unquoted = reported.replace("<<'PYEOF'", "<<PYEOF");
-            assert!(
-                denied(&unquoted),
-                "an unquoted delimiter keeps the conservative treatment"
-            );
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                // These exact old fixtures are invalid Python. Neither the
+                // former `!denied` assertion nor a forced Deny describes the
+                // parser's explicit incomplete-analysis decision correctly
+                // for the quoted report: its `<i>` is not an outer redirect.
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &reported,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_indeterminate() && !result.skipped_due_to_budget,
+                    "raw doc prose is unverified Python ({dialect:?}): {result:?}"
+                );
+                // With an unquoted delimiter the outer shell runs the prose's
+                // backticks, `~/.app/instances/<i>/store-data/` included, so
+                // the shell layers judge that text as well. The grammar error
+                // no longer pre-empts them (#565): never an allow, and a
+                // shell finding may deny outright.
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &unquoted_report,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_indeterminate() || result.is_denied(),
+                    "expanded raw prose must stay blocked ({dialect:?}): {result:?}"
+                );
 
-            // A real outer-shell truncate after the terminator still denies.
-            let outer = "python3 - <<'PY'\nx = 1\nPY\n: > \"$HOME/.bashrc\"";
-            assert!(denied(outer), "a real outer redirect must stay denied");
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &quoted_literal,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "the reported prose in a Python literal must allow ({dialect:?}): {result:?}"
+                );
+
+                let result = evaluate_with_pack_ids_in_dialect(
+                    &unquoted_literal,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "unquoted backticks still require shell verification ({dialect:?}): {result:?}"
+                );
+
+                // An angle-bracket placeholder alone is not shell syntax in
+                // a heredoc, even unquoted. The backticks above are what make
+                // that prose execute at the outer-shell expansion layer.
+                for delimiter in ["'PYEOF'", "PYEOF"] {
+                    let command = format!(
+                        "python3 - <<{delimiter}\nprint(\"~/.app/instances/<i>/store-data/\")\nPYEOF"
+                    );
+                    let result = evaluate_with_pack_ids_in_dialect(
+                        &command,
+                        &["core.git", "core.filesystem"],
+                        dialect,
+                    );
+                    assert!(
+                        result.is_allowed(),
+                        "a placeholder is not a redirect ({dialect:?}): {result:?}"
+                    );
+                }
+
+                // A real outer-shell truncate after the terminator denies
+                // under its concrete filesystem rule.
+                let outer = "python3 - <<'PY'\nx = 1\nPY\n: > \"$HOME/.bashrc\"";
+                let result = evaluate_with_pack_ids_in_dialect(
+                    outer,
+                    &["core.git", "core.filesystem"],
+                    dialect,
+                );
+                assert!(result.is_denied(), "{dialect:?}: {result:?}");
+                let info = result.pattern_info.expect("denial has a rule");
+                assert_eq!(info.pack_id.as_deref(), Some("core.filesystem"));
+                assert_eq!(info.pattern_name.as_deref(), Some("credential-file-write"));
+            }
         }
     }
 
@@ -50046,5 +54478,217 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_560_process_substitution_masking_tests {
+    use super::*;
+
+    #[test]
+    fn quoted_python_process_syntax_is_not_an_outer_shell_sink() {
+        let command = "python3 - <<'PY'\ntext = \"<(not_shell)\"\nPY";
+        let view = crate::heredoc::mask_inert_interpreter_stdin(command);
+        assert!(!view.contains("<(not_shell)"));
+        let mut sinks = Vec::new();
+        collect_posix_process_substitution_sinks(view.as_ref(), &mut sinks);
+        assert!(
+            sinks.is_empty(),
+            "interpreter data became outer shell syntax: {sinks:?}"
+        );
+    }
+
+    #[test]
+    fn quoted_shell_body_remains_visible_to_shell_sink_analysis() {
+        let command = "bash <<'SH'\ncat <(printf dangerous)\nSH";
+        assert_eq!(
+            crate::heredoc::mask_inert_interpreter_stdin(command).as_ref(),
+            command
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_561_git_bash_cmd_switch_tests {
+    use super::*;
+
+    fn parsed(segment: &str, dialect: ShellDialect) -> WindowsLauncherParse {
+        parse_windows_launcher_segment(segment, dialect, 16 * 1024)
+    }
+
+    #[test]
+    fn git_bash_double_slash_c_and_k_are_cmd_execution_switches() {
+        for (switch, expected_launcher) in [
+            ("//c", "cmd /c"),
+            ("//C", "cmd /c"),
+            ("//k", "cmd /k"),
+            ("//K", "cmd /k"),
+        ] {
+            let segment = format!("cmd {switch} \"ver\"");
+            let WindowsLauncherParse::Envelope(envelope) = parsed(&segment, ShellDialect::Posix)
+            else {
+                panic!("Git Bash spelling was not recognized: {segment}");
+            };
+            assert_eq!(envelope.launcher, expected_launcher);
+            assert_eq!(envelope.dialect, ShellDialect::Cmd);
+            assert_eq!(envelope.command, "ver");
+        }
+    }
+
+    #[test]
+    fn git_bash_nonexecuting_switches_can_precede_double_slash_c() {
+        let WindowsLauncherParse::Envelope(envelope) =
+            parsed("cmd //d //s //c \"echo safe\"", ShellDialect::Posix)
+        else {
+            panic!("Git Bash cmd switches were not normalized");
+        };
+        assert_eq!(envelope.command, "echo safe");
+    }
+
+    #[test]
+    fn unknown_double_slash_switches_stay_fail_closed() {
+        assert!(matches!(
+            parsed("cmd //definitely-unknown value", ShellDialect::Posix),
+            WindowsLauncherParse::Unverified(_)
+        ));
+    }
+
+    #[test]
+    fn native_cmd_does_not_borrow_git_bash_switch_normalization() {
+        assert!(!matches!(
+            parsed("cmd //c \"ver\"", ShellDialect::Cmd),
+            WindowsLauncherParse::Envelope(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod windows_redirection_free_view_tests {
+    use super::*;
+
+    /// The Cmd and PowerShell argv views blank each redirection the shell
+    /// performs, at unchanged byte offsets, and nothing else.
+    #[test]
+    fn windows_views_blank_only_redirections() {
+        for (dialect, command, expected) in [
+            (
+                ShellDialect::Cmd,
+                "git>nul reset --hard",
+                "git     reset --hard",
+            ),
+            (
+                ShellDialect::Cmd,
+                ">nul git reset --hard",
+                "     git reset --hard",
+            ),
+            (
+                ShellDialect::Cmd,
+                "git 2>nul reset --hard",
+                "git       reset --hard",
+            ),
+            (ShellDialect::Cmd, "git > nul reset", "git       reset"),
+            // Cmd keeps a descriptor duplication in one word.
+            (ShellDialect::Cmd, "git 2>&1 reset", "git      reset"),
+            (
+                ShellDialect::Cmd,
+                "git>nul & rd /s /q x",
+                "git     & rd /s /q x",
+            ),
+            (
+                ShellDialect::Cmd,
+                "\"git\">\"a b\" reset",
+                "\"git\"       reset",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git>$null reset --hard",
+                "git       reset --hard",
+            ),
+            // PowerShell's tokenizer splits a stream merge at its `&`.
+            (
+                ShellDialect::PowerShell,
+                "git 2>&1 reset --hard",
+                "git      reset --hard",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git *>$null reset",
+                "git         reset",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git > $null reset",
+                "git         reset",
+            ),
+            // A comment is not syntax, and neither is a here-string's body.
+            (
+                ShellDialect::PowerShell,
+                "<# a > b #> git>$null reset",
+                "<# a > b #> git       reset",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "git>$null reset # a > b",
+                "git       reset # a > b",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output @\"\na > b\n\"@ > out.txt",
+                "Write-Output @\"\na > b\n\"@          ",
+            ),
+            // The words after `--%` reach the program verbatim, up to a pipe.
+            (
+                ShellDialect::PowerShell,
+                "git --% x > y | git>$null reset --hard",
+                "git --% x > y | git       reset --hard",
+            ),
+            // Neither shell has `<<`: a POSIX heredoc stays one, its body
+            // data to the reader, while the shell's own redirects go.
+            (
+                ShellDialect::Cmd,
+                "cat <<'EOF' >out.txt\nrm -rf x\nEOF",
+                "cat <<'EOF'         \nrm -rf x\nEOF",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "cat <<'EOF' >out.txt\nrm -rf x\nEOF",
+                "cat <<'EOF'         \nrm -rf x\nEOF",
+            ),
+            // Cmd has input redirection; PowerShell (below) does not.
+            (
+                ShellDialect::Cmd,
+                "git<nul reset --hard",
+                "git     reset --hard",
+            ),
+        ] {
+            assert_eq!(
+                windows_redirection_free_view(command, dialect).as_deref(),
+                Some(expected),
+                "{dialect:?} {command:?}"
+            );
+        }
+        for (dialect, command) in [
+            (ShellDialect::Cmd, "echo git^>nul reset"),
+            (ShellDialect::Cmd, "echo \"a>b\""),
+            (ShellDialect::Cmd, "git status"),
+            (ShellDialect::PowerShell, "Write-Output 'a>b'"),
+            (ShellDialect::PowerShell, "git status # a > b"),
+            (ShellDialect::PowerShell, "<# a > b #> git status"),
+            (ShellDialect::PowerShell, "cmd /c --% echo a > b"),
+            (ShellDialect::Cmd, "cat <<EOF\nrm -rf x\nEOF"),
+            (ShellDialect::Cmd, "git 0<<x reset"),
+            (ShellDialect::PowerShell, "cat << EOF\nrm -rf x\nEOF"),
+            (ShellDialect::PowerShell, "git<<<x reset --hard"),
+            (ShellDialect::PowerShell, "git<nul reset --hard"),
+            (ShellDialect::PowerShell, "rm -ri ./tree <> /etc/passwd"),
+            (ShellDialect::Posix, "git>/dev/null reset --hard"),
+            (ShellDialect::Unknown, "git>nul reset --hard"),
+        ] {
+            assert_eq!(
+                windows_redirection_free_view(command, dialect),
+                None,
+                "{dialect:?} {command:?}"
+            );
+        }
     }
 }

@@ -1615,7 +1615,23 @@ pub(crate) fn starts_with_shell_redirection(s: &str) -> bool {
 }
 
 #[must_use]
-pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
+pub fn consume_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
+    consume_word_token_inner(bytes, i, len, false)
+}
+
+/// Consume one POSIX argv word, excluding adjacent local redirections.
+/// Normalization deliberately keeps redirections in its token view; program
+/// extraction needs the argv boundary, but must use the same quote walker.
+pub(crate) fn consume_posix_word_token(bytes: &[u8], i: usize, len: usize) -> usize {
+    consume_word_token_inner(bytes, i, len, true)
+}
+
+fn consume_word_token_inner(
+    bytes: &[u8],
+    mut i: usize,
+    len: usize,
+    stop_at_redirect: bool,
+) -> usize {
     while i < len {
         let b = bytes[i];
 
@@ -1633,7 +1649,14 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
             continue;
         }
 
+        if stop_at_redirect && matches!(b, b'<' | b'>') {
+            break;
+        }
+
         if b == b'&' && i + 1 < len && bytes[i + 1] == b'>' {
+            if stop_at_redirect {
+                break;
+            }
             i += 2;
             if i < len && bytes[i] == b'>' {
                 i += 1;
@@ -1646,6 +1669,32 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
         }
 
         match b {
+            b'$' if i + 1 < len && bytes[i + 1] == b'\'' => {
+                // ANSI-C quotes are one segment of the same word. An escaped
+                // apostrophe does not end that segment (issue #570).
+                i += 2;
+                while i < len && bytes[i] != b'\'' {
+                    i = if bytes[i] == b'\\' {
+                        (i + 2).min(len)
+                    } else {
+                        i + 1
+                    };
+                }
+                i = (i + 1).min(len);
+            }
+            b'`' => {
+                // Preserve a complete substitution for the fallible decoder;
+                // never pretend the prefix before its whitespace is static.
+                i += 1;
+                while i < len && bytes[i] != b'`' {
+                    i = if bytes[i] == b'\\' {
+                        (i + 2).min(len)
+                    } else {
+                        i + 1
+                    };
+                }
+                i = (i + 1).min(len);
+            }
             b'\\' => {
                 // Handle CRLF escape (consumes 3 bytes: \, \r, \n)
                 if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
@@ -1935,12 +1984,24 @@ enum PosixQuote {
 }
 
 pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
+    decode_posix_token(token, false).unwrap_or(Cow::Borrowed(token))
+}
+
+/// The value of a literal POSIX argv word. Unlike the syntax matching view,
+/// failure is explicit: expansions, translation, and malformed quoting must
+/// not be mistaken for a completely recovered inline program (issue #570).
+pub(crate) fn decode_posix_literal_word(token: &str) -> Option<Cow<'_, str>> {
+    decode_posix_token(token, true)
+}
+
+fn decode_posix_token(token: &str, literal_word: bool) -> Option<Cow<'_, str>> {
     if !token
         .as_bytes()
         .iter()
         .any(|byte| matches!(*byte, b'\'' | b'"' | b'\\' | b'$' | b'`' | b'<' | b'>'))
     {
-        return Cow::Borrowed(token);
+        return (!literal_word || !token.contains(['*', '?', '[', '{', '~']))
+            .then_some(Cow::Borrowed(token));
     }
 
     let mut output = String::with_capacity(token.len());
@@ -1964,9 +2025,7 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return Cow::Borrowed(token);
-                    };
+                    let escaped = chars.next()?;
                     match escaped {
                         '\n' => changed = true,
                         '\r' if chars.peek() == Some(&'\n') => {
@@ -1985,8 +2044,10 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                         }
                     }
                 }
-                '$' => return Cow::Borrowed(token),
-                '`' => return Cow::Borrowed(token),
+                '$' if literal_word && !posix_dollar_expands(chars.peek().copied()) => {
+                    output.push('$');
+                }
+                '$' | '`' => return None,
                 other => output.push(other),
             },
             PosixQuote::Unquoted => match ch {
@@ -1999,9 +2060,7 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     changed = true;
                 }
                 '\\' => {
-                    let Some(escaped) = chars.next() else {
-                        return Cow::Borrowed(token);
-                    };
+                    let escaped = chars.next()?;
                     changed = true;
                     match escaped {
                         '\n' => {}
@@ -2014,11 +2073,14 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                 '$' if chars.peek() == Some(&'\'') => {
                     chars.next();
                     if decode_ansi_c_quoted(&mut chars, &mut output).is_err() {
-                        return Cow::Borrowed(token);
+                        return None;
                     }
                     changed = true;
                 }
                 '$' if chars.peek() == Some(&'"') => {
+                    if literal_word {
+                        return None; // The locale may replace the program.
+                    }
                     // Bash locale-translation quoting has double-quote shell
                     // semantics after translation. Literal option spellings
                     // are deterministic; nested expansions still fail open.
@@ -2026,23 +2088,36 @@ pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
                     quote = PosixQuote::Double;
                     changed = true;
                 }
-                '$' => return Cow::Borrowed(token),
-                '`' => return Cow::Borrowed(token),
-                '<' | '>' if chars.peek() == Some(&'(') => return Cow::Borrowed(token),
+                '$' if literal_word && !posix_dollar_expands(chars.peek().copied()) => {
+                    output.push('$');
+                }
+                '$' | '`' => return None,
+                '<' | '>' if literal_word || chars.peek() == Some(&'(') => return None,
+                '*' | '?' | '[' | '{' | '~' if literal_word => return None,
                 other => output.push(other),
             },
         }
     }
 
     if quote != PosixQuote::Unquoted {
-        return Cow::Borrowed(token);
+        return None;
     }
 
     if changed {
-        Cow::Owned(output)
+        Some(Cow::Owned(output))
     } else {
-        Cow::Borrowed(token)
+        Some(Cow::Borrowed(token))
     }
+}
+
+fn posix_dollar_expands(next: Option<char>) -> bool {
+    next.is_some_and(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '_' | '(' | '{' | '[' | '$' | '?' | '!' | '#' | '@' | '*' | '-'
+            )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2666,6 +2741,7 @@ pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -
 }
 
 fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut tokens = NormalizeTokens::new();
@@ -2763,6 +2839,7 @@ fn cmd_line_continuation_end(bytes: &[u8], i: usize, len: usize) -> Option<usize
 }
 
 fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
     let mut tokens = NormalizeTokens::new();
@@ -3128,6 +3205,7 @@ fn cmd_byte_is_caret_escaped(bytes: &[u8], index: usize) -> bool {
 
 #[must_use]
 pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::ShellTokenization);
     let bytes = command.as_bytes();
     let len = bytes.len();
 
@@ -4085,6 +4163,7 @@ fn normalize_decoded_command(command: &str, dialect: ShellDialect) -> Cow<'_, st
 #[inline]
 #[must_use]
 pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    let _phase = crate::perf::PhaseTimer::start("normalization");
     match dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
             let stripped = strip_wrapper_prefixes(cmd);

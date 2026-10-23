@@ -32,6 +32,64 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   destructive command was one quoted word, while the unquoted and `bash -c`
   forms were denied. They are now command-string runners. `herdr agent
   prompt`, which sends text to an agent rather than a shell, stays data.
+- **Audit universal allowlist globs as unrestricted (#545).** Doctor now
+  recognizes composite patterns such as `**/`, `**/*`, and `**/**` that match
+  every working directory, including equivalent normalized root paths.
+  Permanent grants using these patterns receive the existing actionable
+  rule and provenance warnings in project, user, and system layers. Bounded
+  patterns and temporary or inactive entries retain their classifications;
+  the audit does not change matching or rewrite grants in `--fix` mode.
+- **Inspect complete inline programs inside compound shell commands (#544).**
+  Python and JavaScript literals carried through variables remain checked
+  when the invocation has another statement, a pipeline, redirection, an
+  environment assignment, or supported trailing operands. Exact source ownership
+  is proved separately from eligibility for the documentation exemption, so
+  another shell consumer cannot suppress inspection. Static argument arrays
+  remain data, and recovered commands keep their own rule and allowlist
+  ownership. Later Node options that can replace its program cannot establish
+  executable-source ownership for the earlier argument.
+- **Follow literal execution dependencies without scanning argument data (#544).**
+  A bounded proof now follows a static string into a direct literal Python
+  `exec`/`eval` or JavaScript `eval` program that passes it to a known shell sink.
+  The recovered command retains its own rule and allowlist identity. Static
+  argv and option literals owned by named execution checks keep their data
+  roles, while callbacks, nested calls, dynamic options, and shell source
+  remain visible. Unreferenced strings and evaluated print calls are not
+  promoted to executable shell commands. Hoisted JavaScript declarations and
+  ambiguous identifier spellings withdraw the optional binding proof. The
+  POSIX eval collector respects proven interpreter stdin ownership while
+  language analysis and shell consumers retain the original source.
+- **Accept literal numeric ports in data-transfer proofs (#543).** Static
+  decimal SSH and SCP port arguments retain the existing file-data treatment.
+  Variable ports, substitutions, and unproved transport options remain visible
+  to execution checks.
+- **Review Python source selected by shell expansion (#538).** A Python `-c`
+  program supplied entirely by an unresolved shell expansion receives the
+  existing inline-launcher denial rule. The check follows Python option
+  ownership and outer shell quoting, preserving literal or escaped dollar
+  signs, statically resolved source, and `-c` text passed as script arguments.
+- **Inspect the arguments produced by executable variables (#540).** Literal
+  assignments such as `X='git reset --hard'; $X` now reach the Git rule for
+  the expanded command instead of being mistaken for one quoted executable
+  name. Quoted variable references preserve one argument, while supported
+  unquoted expansion splits fields without reinterpreting their contents as
+  shell syntax. Unknown splitting, globbing, and interpreter flags introduced
+  by expansion require review. Rule-specific grants and original source spans
+  remain attached to the command that actually needs them.
+- **Keep quoted flowctl receipt text as data (#538, #540).** Complete static
+  `gate check` and `gate receipt` command operands can contain quoted shell
+  punctuation without triggering destructive-command rules. Live expansions,
+  incomplete words, unknown options, redirects, and later commands retain
+  their execution checks. Regression cases exercise both `dcg test` and the
+  actual hook protocol. The inline extractor shares the complete receipt
+  grammar, so a dynamic `FLOWCTL` executable no longer causes static receipt
+  values to be inspected as speculative shell programs.
+- **Keep interpreter callbacks independent of outer execution grants (#544).**
+  Literal command evidence inside callbacks, assignments, and argument side
+  effects can no longer inherit an enclosing call's already-checked status.
+  Destructive commands carried through variables retain their own rule and
+  cannot be hidden by an allowlist entry for the outer execution sink. Static
+  argument arrays and option values preserve their existing data treatment.
 - **Check substitutions carried by interpreter variables (#544).** Python and
   JavaScript literal values passed through variables or opaque calls now reach
   the existing command evaluator, including encoded substitution markers.

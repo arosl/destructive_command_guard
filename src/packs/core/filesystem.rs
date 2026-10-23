@@ -729,6 +729,136 @@ pub(crate) enum RmExecutableCertainty {
     Other,
 }
 
+/// The two unlink rules share an executed-argv proof, not a raw-text search.
+/// Keep the arguments as source text for their existing pattern attribution.
+pub(crate) struct UnlinkCommand {
+    pub(crate) matching_view: String,
+    pub(crate) safe: bool,
+}
+
+pub(crate) fn is_unlink_rule(name: Option<&str>) -> bool {
+    matches!(name, Some("unlink-root-home" | "unlink-general"))
+}
+
+/// Recover a literal POSIX unlink invocation without interpreting its argv as
+/// another command (#550). Shell quote removal applies to the executable word:
+/// `'unlink'`, `u'n'link` and `'/usr/bin/unlink'` all execute the same utility.
+/// Only that word is replaced in the matching view; operands retain their
+/// quoting, and the original command remains available to every other rule.
+pub(crate) fn unlink_command_for_pattern_matching(
+    command: &str,
+    dialect: ShellDialect,
+) -> Option<UnlinkCommand> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || (!command.contains("unlink") && !command.contains(['\'', '"', '\\']))
+    {
+        return None;
+    }
+    let (ungrouped, _) = strip_leading_posix_group_openers(command);
+    let (unprefixed, _) = strip_leading_rm_prefixes(ungrouped);
+    let stripped = crate::normalize::strip_wrapper_prefixes(unprefixed);
+    if stripped.wrapper_limit_reached {
+        return None;
+    }
+    let source = stripped.normalized.as_ref();
+    let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
+    let executable = tokens.first()?;
+    if executable.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let executable_end = crate::normalize::consume_posix_word_token(
+        source.as_bytes(),
+        executable.byte_range.start,
+        source.len(),
+    );
+    let decoded = crate::normalize::decode_posix_literal_word(
+        source.get(executable.byte_range.start..executable_end)?,
+    )?;
+    // `xargs [OPTION]... unlink [ARG]...` runs unlink with its input items
+    // appended, or substituted for an `-I` placeholder, so the real operands
+    // never appear on the line: `cat list | xargs -I{} unlink {}` was allowed
+    // once the rules were scoped to the executed command. Judge the child
+    // invocation with a synthetic operand standing for that input, as the rm
+    // parser does; input can never earn the temp or help exemption.
+    if decoded.rsplit('/').next() == Some("xargs") {
+        let frontend_tokens = tokenize_for_normalization(source);
+        let child_index = xargs_command_index(source, &frontend_tokens)?;
+        let child = rm_frontend_suffix(source, &frontend_tokens, child_index)?;
+        let nested = unlink_command_for_pattern_matching(child, dialect)?;
+        return Some(UnlinkCommand {
+            matching_view: format!("{} ./__dcg_xargs_input__", nested.matching_view.trim_end()),
+            safe: false,
+        });
+    }
+    if decoded.rsplit('/').next() != Some("unlink") {
+        return None;
+    }
+
+    let arguments: Vec<&str> = tokens
+        .iter()
+        .skip(1)
+        .filter_map(|token| token.text(source))
+        .collect();
+    let single_command = executable_end == executable.byte_range.end
+        && tokens
+            .iter()
+            .all(|token| token.kind == NormalizeTokenKind::Word);
+    let informational = single_command
+        && matches!(arguments.as_slice(), [argument] if
+            crate::normalize::decode_posix_literal_word(argument)
+                .is_some_and(|value| matches!(value.as_ref(), "--help" | "--version")));
+    let operand = match arguments.as_slice() {
+        [operand] => Some(*operand),
+        [options_end, operand]
+            if crate::normalize::decode_posix_literal_word(options_end)
+                .is_some_and(|value| value == "--") =>
+        {
+            Some(*operand)
+        }
+        _ => None,
+    };
+    // Exempt only one statically recovered target below a literal temp root.
+    // Decoding a quoted operand here proves its value; it never turns that
+    // value into executable source or makes a dynamic temp root trustworthy.
+    let temporary = single_command
+        && command == unprefixed
+        && !crate::normalize::wrapper_changes_filesystem_context(command)
+        && operand
+            // Unknown dialects can interpret POSIX quoting as path bytes or
+            // expand native shell syntax. Pack APIs carry no dialect, so only
+            // syntax-free ASCII operands get this new exemption there.
+            // Preserve the old temp rules' backslash boundary in all dialects.
+            .filter(|operand| {
+                !operand.contains('\\')
+                    && (dialect == ShellDialect::Posix
+                        || operand.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                        }))
+            })
+            .and_then(crate::normalize::decode_posix_literal_word)
+            .is_some_and(|path| {
+                !path.contains(['\0', '\\'])
+                    && LITERAL_TEMP_PREFIXES
+                        .iter()
+                        .find_map(|prefix| path.strip_prefix(prefix))
+                        .is_some_and(|suffix| {
+                            temp_path_suffix_has_real_component(suffix)
+                                && !has_dotdot_segment(suffix)
+                                // Win32 can normalize trailing dots/spaces;
+                                // an unknown shell cannot prove these literal.
+                                && (dialect == ShellDialect::Posix
+                                    || suffix.split('/').all(|component| {
+                                        !component.ends_with(['.', ' '])
+                                    }))
+                        })
+            });
+    Some(UnlinkCommand {
+        matching_view: format!("unlink {}", &source[executable_end..]),
+        safe: informational || temporary,
+    })
+}
+
 #[derive(Debug)]
 struct PathToken<'a> {
     unquoted: &'a str,
@@ -929,6 +1059,7 @@ fn parse_rm_interactive_mode(value: &str) -> Option<RmInteractiveMode> {
 pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
     let segments = crate::packs::split_command_segments(command);
     if segments.len() > 1 {
+        let stdin_context = RmStdinContext::new(command);
         let mut saw_allow = false;
         for segment in segments {
             let command_start = command.as_ptr() as usize;
@@ -936,7 +1067,7 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
             let automated_stdin = segment_start
                 .checked_sub(command_start)
                 .is_some_and(|offset| {
-                    rm_segment_receives_automated_stdin(command, offset, ShellDialect::Posix)
+                    stdin_context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
                 });
             match parse_rm_command_segment(segment, automated_stdin) {
                 RmParseDecision::Deny(hit) => return RmParseDecision::Deny(hit),
@@ -970,20 +1101,59 @@ pub(crate) fn rm_segment_receives_automated_stdin(
     segment_start: usize,
     dialect: ShellDialect,
 ) -> bool {
-    let Some(prefix) = command.get(..segment_start) else {
-        return false;
-    };
-    let prefix = prefix.trim_end();
-    if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
-        return true;
+    RmStdinContext::new(command).segment_receives_automated_stdin(segment_start, dialect)
+}
+
+/// Source-wide prerequisites for the existing stdin provenance parsers.
+///
+/// A multiline command can contribute hundreds of segment queries. Re-splitting
+/// and tokenizing every preceding segment for each query is quadratic even when
+/// the command cannot contain a pipeline or an `exec` redirect. These facts are
+/// computed once from the exact source and shared by all of its segment queries;
+/// they do not classify a command, choose packs, or change either parser.
+pub(crate) struct RmStdinContext<'a> {
+    command: &'a str,
+    has_pipe: bool,
+    has_exec_stdin_redirect: bool,
+}
+
+impl<'a> RmStdinContext<'a> {
+    pub(crate) fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            has_pipe: command.contains('|'),
+            has_exec_stdin_redirect: command.contains("exec") && command.contains('<'),
+        }
     }
 
-    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
-        return false;
-    }
+    pub(crate) fn segment_receives_automated_stdin(
+        &self,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = self.command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
 
-    posix_pipeline_group_is_active(command, segment_start)
-        || prior_posix_exec_redirects_stdin(command, segment_start)
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+
+        // A group can acquire automated stdin only from a literal `|` byte.
+        // The exec parser recognizes an exact raw token basename after outer
+        // quote removal, so every token it accepts contains contiguous `exec`.
+        // Its stdin redirect grammar also requires a literal `<` byte.
+        // Quoted data and escapes may make either fact a false positive; the
+        // complete existing parser still resolves those cases. Neither fact
+        // can exclude a positive result from its respective parser.
+        (self.has_pipe && posix_pipeline_group_is_active(self.command, segment_start))
+            || (self.has_exec_stdin_redirect
+                && prior_posix_exec_redirects_stdin(self.command, segment_start))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1705,6 +1875,10 @@ fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
                 .normalized
                 .as_ref(),
         )
+        // Leading redirects, grouping, and a redirect attached to argv0 do
+        // not change the executable. The unlink proof shares the actual word
+        // boundary so those forms cannot hide a quoted basename from this gate.
+        || unlink_command_for_pattern_matching(segment, ShellDialect::Posix).is_some()
 }
 
 /// Whether the first word of `segment`, as spelled, is a writer the semantic
@@ -1729,7 +1903,8 @@ fn segment_names_semantic_writer(segment: &str) -> bool {
             let executable = rm_frontend_basename(decoded.as_ref());
             // An obfuscated writer spelling (`t''ee`, `\tee`) carries no
             // keyword; `credential-file-write` still has to see it.
-            executable == "rm" || super::credential_files::is_credential_writer(executable)
+            matches!(executable, "rm" | "unlink")
+                || super::credential_files::is_credential_writer(executable)
         })
 }
 
@@ -4468,7 +4643,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     // `--no-preserve-root` and every other long option still fall through to the
     // destructive rules, and a second `--` would have to satisfy the
     // temp-operand group (it cannot), so `rm -rf -- -- /tmp/x` keeps denying.
-    vec![
+    let mut patterns = vec![
         // The baseline Format-Volume / Clear-Disk rules (#451) mirror
         // windows.system's regexes, so they take its preview carve-out too:
         // a bare `-WhatIf` is a preview, `-WhatIf:$false` is not.
@@ -4769,11 +4944,13 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `/Users/<user>` root, or a sensitive system tree — and both
         // sides carry the standard `..`-traversal guard. Dynamic paths
         // (`$`, backticks, backslashes) fall through to the fail-closed
-        // rules.
+        // rules, and so does an unquoted `{`: bash expands a brace list
+        // before mv runs, past the `..` guard, so
+        // `mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/` moved `/etc`.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-to-trash",
-            r"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:~/|/home/[^/\s]+/|/Users/[^/\s]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&]*)+[ \t]+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&]*)?\s*$"
+            r"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:~/|/home/[^/\s{]+/|/Users/[^/\s{]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&{]*)+[ \t]+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&{]*)?\s*$"
         ),
         // -----------------------------------------------------------------
         // `mv` into the platform Trash, with quoted paths and a resolved
@@ -4794,10 +4971,20 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `/home/<user>` or `/Users/<user>` root, nor a sensitive system
         // tree), only with quoted variants added. The destination is still a
         // Trash directory, so the rescued operation stays recoverable.
+        //
+        // Quoted sources read `;`, `|` and `&` as file-name bytes, as
+        // `mv-within-home` does (GitHub #552): `mv "~/Documents/a & b.txt"
+        // ~/.Trash/` was denied while the same name with a space was allowed.
+        // That needs the regex to read quoting exactly as the shell does, so
+        // the dynamic-byte guard scans the whole text (no backslash anywhere
+        // means a quote closes only on its own kind), and an unquoted source
+        // may contain no quote character and no `{` (bash brace expansion,
+        // which would get past the `..` guard). Unquoted user names carry the
+        // component restrictions too.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-to-trash-quoted",
-            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~/|/home/[^/\s'"]+/|/Users/[^/\s'"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&]*|"(?:~/|/home/[^/"]+/|/Users/[^/"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|")|[^"]*/\.\.(?:/|"))[A-Za-z0-9._][^"$`;|&]*"|'(?:~/|/home/[^/']+/|/Users/[^/']+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|')|[^']*/\.\.(?:/|'))[A-Za-z0-9._][^'$`;|&]*'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?|"(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?"|'(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~/|/home/[^/\s'"$`;|&{]+/|/Users/[^/\s'"$`;|&{]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&'"{]*|"(?:~/|/home/[^/"]+/|/Users/[^/"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|")|[^"]*/\.\.(?:/|"))[A-Za-z0-9._][^"$`]*"|'(?:~/|/home/[^/']+/|/Users/[^/']+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|')|[^']*/\.\.(?:/|'))[A-Za-z0-9._][^'$`]*'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"'{]*)?|"(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?"|'(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?')[ \t]*$"#
         ),
         // -----------------------------------------------------------------
         // Ordinary renames and moves *inside* one home subtree.
@@ -4831,16 +5018,34 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // - `..` is rejected in every later component, so no token can climb
         //   out of the home tree it names.
         // - Dynamic expansion (`$`, backticks, backslashes) is excluded
-        //   globally and inside every path token, so `$HOME/...` and command
-        //   substitution still fall through to the fail-closed rules. Flags
-        //   may not take a value, which keeps `mv -t /etc ...` and
-        //   `--target-directory=/etc` out.
+        //   anywhere in the command and inside every path token, so
+        //   `$HOME/...` and command substitution still fall through to the
+        //   fail-closed rules. Flags may not take a value, which keeps
+        //   `mv -t /etc ...` and `--target-directory=/etc` out.
+        // - Brace expansion is expansion too: an unquoted `{` withholds the
+        //   rescue. Bash expands the token before mv sees it, past both checks
+        //   above: `~/{..,a}/{..,b}/etc` becomes `~/../../etc`, and
+        //   `~/{Documents,.ssh}/id_rsa` becomes a dotfile path. Inside quotes
+        //   a brace is literal and stays allowed.
         // - Anchored whole-command, so a compound that appends a destructive
-        //   second segment is not rescued.
+        //   second segment is not rescued: an unquoted `;`, `|` or `&` can
+        //   appear in no token, including the home-root user name.
+        //
+        // Inside a quoted token, `;`, `|` and `&` are file-name bytes, not
+        // separators (GitHub #552): `mv "~/Downloads/a & b.pdf" ...` is one
+        // two-operand mv, and the segmenter that hands this pattern its text
+        // already keeps it whole. The quoted classes used to exclude them,
+        // which denied any personal file named with `&` while the same name
+        // under /tmp, or with any other punctuation, was allowed. That
+        // exclusion was only needed because the dynamic-expansion lookahead
+        // stopped scanning at the first `;|&`; it now scans the whole text.
+        // With no backslash anywhere, a quote can only be closed by its own
+        // kind, so each quoted token this pattern reads is exactly the word
+        // the shell reads, and no unquoted separator can hide inside one.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-within-home",
-            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
         ),
         // -----------------------------------------------------------------
         // The same ordinary rename, written with a relative source.
@@ -4872,19 +5077,29 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // - A leading `/` cannot match at all: the component class excludes
         //   it, so absolute sources keep going through `mv-within-home`.
         // - `..` is refused in every later component, so no source can climb
-        //   out of the tree it names.
-        // - Dynamic expansion is excluded globally and inside every token,
-        //   and the whole command is anchored, so a compound that appends a
-        //   destructive second segment is not rescued.
+        //   out of the tree it names, and an unquoted `{` withholds the
+        //   rescue on both sides, since `{..,a}/x` expands to `../x`.
+        // - Dynamic expansion is excluded anywhere in the command and inside
+        //   every token, and the whole command is anchored, so a compound
+        //   that appends a destructive second segment is not rescued.
+        // - Quoted tokens read `;`, `|` and `&` as the file-name bytes they
+        //   are, exactly as `mv-within-home` does (GitHub #552).
         // The destination alternation is lifted verbatim from
         // `mv-within-home` so the two cannot disagree about what a
         // home-rooted target is.
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-relative-into-home",
-            r#"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:\./)?(?![-~.])[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:\./)?(?![-~.])[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)/(?!\.)[^/\s'"$`;|&]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`;|&]+(?:/(?!\.\.(?:/|"))[^/"$`;|&]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`;|&]+(?:/(?!\.\.(?:/|'))[^/'$`;|&]+)*/?')[ \t]*$"#
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:\./)?(?![-~.])[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:\./)?(?![-~.])[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
         ),
-    ]
+    ];
+    // Every possible safe match still runs its complete authored regex. The
+    // opt-in proof only avoids compiling/running an anchored backtracking
+    // pattern when its required literal prefix cannot match (#555).
+    for pattern in &mut patterns {
+        pattern.regex.enable_anchored_prefix_filter();
+    }
+    patterns
 }
 
 /// The destructive patterns for `core.filesystem`.
@@ -5305,11 +5520,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // is one-shot data destruction with no recovery and no recursion
         // budget to slow it down.
         //
-        // The regex matches `unlink` at any word boundary (so it fires in
-        // compound forms and after `sudo`/`env` wrappers, and on
-        // path-prefixed binaries via PATH_NORMALIZER), then a sensitive
-        // path token. Single argument only — multi-arg unlink isn't
-        // standard.
+        // The executed-argv classifier supplies a bare command word for
+        // literal quoted/path-prefixed spellings. These patterns retain the
+        // established rule IDs and sensitive-path attribution, with executable
+        // scoping on the legacy raw-text fallback. Single argument only —
+        // multi-arg unlink isn't standard.
         destructive_pattern!(
             "unlink-root-home",
             r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
@@ -5326,7 +5541,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                `unlink <file>.deleted-...` after a few days.\n\
              - `cp <file> <file>.bak && unlink <file>` to keep an explicit backup.\n\
              - `unlink /tmp/<subdir>/scratch` is allowed (temp dirs).",
-            UNLINK_SUGGESTIONS
+            UNLINK_SUGGESTIONS,
+            executables = ["unlink"]
         ),
         // ----- `unlink <file>` (High: any other target) -----
         //
@@ -5345,7 +5561,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Make a backup: `cp <file> <file>.bak`.\n\
              - For temp scratch: `unlink /tmp/<subdir>/scratch` is allowed.\n\
              - Use `mv <file> /tmp/quarantine-<file>` if you want a delayed delete.",
-            UNLINK_SUGGESTIONS
+            UNLINK_SUGGESTIONS,
+            executables = ["unlink"]
         ),
         // ----- destructive `truncate -s/--size` (Critical: root/home/system) -----
         //
@@ -5608,9 +5825,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // path forms. Without these, `mv $'/etc' /tmp/x` slipped
         // through as a HIGH-impact bypass since mv has no general
         // tier to fall back on.
+        //
+        // `mv` must be a whole shell word (#550): `\bmv\b` also matched it
+        // inside a hyphenated or dotted token, so `git checkout -b
+        // fix-mv-handling /home/u/repo`, `tool x-mv …` and `tool --no-mv
+        // /etc/hosts` were denied as moves. A quoted or path-prefixed `mv`
+        // still counts, and so does a word the shell still reads as `mv`:
+        // empty quotes glued to it (`mv"" /etc /x`) or a redirection glued
+        // to it (`mv>/dev/null /etc /x`), both of which run mv.
         destructive_pattern!(
             "mv-sensitive-source-root-home",
-            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?(?=[\s;&|)<>'"]|$)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`mv /etc /tmp/x && rm -rf /tmp/x` is the canonical cross-segment bypass: \
@@ -5643,9 +5868,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // continuation, not part of any path token, so it is excluded from
         // the backslash evidence (#356). A doubled backslash before a newline
         // still matches at the first backslash, as it is a real escaped byte.
+        // The same whole-word `mv` boundary as above (#550).
         destructive_pattern!(
             "mv-dynamic-path",
-            r"\bmv\b[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))",
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?(?=[\s;&|)<>'"]|$)[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))"#,
             "mv with a shell-expanded or escaped path cannot be verified before execution.",
             High,
             "Shell variables and command substitutions are controlled by the calling environment and may resolve to `/`, `/etc`, a home directory, or another persistent tree. Backslash escapes can also hide traversal from lexical path checks, so dcg cannot safely classify this move.\n\n\
@@ -5957,9 +6183,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // The shell expands redirect targets at runtime. A variable, command
         // substitution, or backslash-obfuscated suffix can therefore resolve
         // outside an apparent temp path before O_TRUNC opens the file.
+        //
+        // `(?!>)` after the operator keeps an append out (#575): the
+        // lookbehind already stops a match from starting at the second `>` of
+        // `>>`, but without it a match could start at the first one and let
+        // the target class swallow the second (`>>"$LOG"`, `2>>$LOG`,
+        // `&>>"$LOG"`), so only the spaced spelling was treated as an append.
         destructive_pattern!(
             "redirect-truncate-dynamic-path",
-            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:[^|;&\s]*[\\$`]|~[A-Za-z_][^|;&\s]*|(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))/[^|;&\s]*['"?*\[][^|;&\s]*|[%!][^|;&\s]*|\^(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))[^|;&\s]+)"#,
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)(?!>)\s*(?:[^|;&\s]*[\\$`]|~[A-Za-z_][^|;&\s]*|(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))/[^|;&\s]*['"?*\[][^|;&\s]*|[%!][^|;&\s]*|\^(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))[^|;&\s]+)"#,
             "shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval.",
             High,
             "The redirect target is expanded by the shell at runtime, so dcg cannot prove where it points before the file is opened with O_TRUNC.\n\n\
@@ -6642,6 +6874,149 @@ mod tests {
         ] {
             assert_no_match(&pack, cmd);
         }
+    }
+
+    #[test]
+    fn mv_rules_match_the_whole_command_word_issue_550() {
+        let pack = create_pack();
+        for command in [
+            "git checkout -b fix-mv-handling /home/user/repo",
+            "tool x-mv /home/user/repo",
+            "tool mv-y /home/user/repo",
+            "tool --no-mv /etc/hosts",
+            "tool x.mv /etc/hosts",
+            "tool --mv=/etc/hosts",
+            "tool fix-mv-$x",
+        ] {
+            assert_no_match(&pack, command);
+        }
+        for (command, rule) in [
+            ("mv /home/user/repo /tmp/r", "mv-sensitive-source-root-home"),
+            (
+                "'mv' /home/user/repo /tmp/r",
+                "mv-sensitive-source-root-home",
+            ),
+            ("\"mv\" /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
+            ("/bin/mv /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
+            ("sudo mv /etc /tmp/x", "mv-sensitive-source-root-home"),
+            (
+                "find . -exec mv {} /etc/ \\;",
+                "mv-sensitive-source-root-home",
+            ),
+            ("mv \"$src\" d/", "mv-dynamic-path"),
+            ("'mv' $src d/", "mv-dynamic-path"),
+            // Empty quotes or a redirection glued to the word still run mv.
+            ("mv\"\" /etc /tmp/x", "mv-sensitive-source-root-home"),
+            (
+                "mv'' /home/user/repo /tmp/r",
+                "mv-sensitive-source-root-home",
+            ),
+            ("mv>/dev/null /etc /tmp/x", "mv-sensitive-source-root-home"),
+            ("mv</dev/null /etc /tmp/x", "mv-sensitive-source-root-home"),
+            ("mv\"\" \"$src\" d/", "mv-dynamic-path"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+    }
+
+    #[test]
+    fn unlink_rules_are_scoped_to_the_executed_command_issue_550() {
+        let pack = create_pack();
+
+        for command in [
+            "ob sync-unlink --path /home/user/vault",
+            "foo --unlink /tmp/x",
+            "cat unlink /tmp/x",
+            "printf '%s' unlink /etc/passwd",
+            "echo 'unlink' /etc/passwd",
+            "cat '/tmp/unlink /etc/passwd'",
+            "command -v 'unlink'",
+            "'un link' /etc/passwd",
+            r"'un\link' /etc/passwd",
+        ] {
+            assert_no_match(&pack, command);
+        }
+
+        for command in [
+            "'unlink' /home/user/notes.txt",
+            "\"unlink\" /etc/passwd",
+            "'unlink' '/etc/passwd'",
+            "u'n'link /etc/passwd",
+            "u'n'l'i'n'k' /etc/passwd",
+            r"un\link /etc/passwd",
+            r"$'\165nlink' /etc/passwd",
+            "'/usr/bin/unlink' /etc/shadow",
+            "\"/usr/bin/unlink\" /etc/passwd",
+            "('/usr/bin/unlink' /etc/passwd)",
+            "/usr/bin/unlink /etc/shadow",
+            "sudo unlink /etc/sudoers",
+            "sudo 'unlink' /etc/sudoers",
+            "env FOO=bar unlink /etc/passwd",
+            "env FOO=bar 'unlink' /etc/passwd",
+            "command unlink /etc/passwd",
+            "command -- 'unlink' /etc/passwd",
+            "u'n'l'i'n'k'>/tmp/unlink.log /etc/passwd",
+            ">/tmp/unlink.log u'n'l'i'n'k' /etc/passwd",
+        ] {
+            assert_blocks(&pack, command, "unlink");
+        }
+    }
+
+    #[test]
+    fn quoted_unlink_preserves_literal_temp_and_information_exceptions() {
+        let pack = create_pack();
+        for command in [
+            "'unlink' /tmp/scratch",
+            "\"/usr/bin/unlink\" /var/tmp/cache",
+            "u'n'l'i'n'k' -- /private/tmp/cache",
+            "command -- 'unlink' /private/var/tmp/cache",
+            "'unlink' --help",
+            "u'n'l'i'n'k' --version",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+        // Quoted operands are a POSIX-only proof. The standalone Pack API has
+        // no dialect and must not grant new exemptions for Cmd expansion,
+        // quote removal, or Windows path normalization.
+        for command in [
+            "'unlink' '/tmp/file with spaces'",
+            "'unlink' /tmp/\"literal;name\"",
+            r#"unlink "/tmp/%DCG_ESCAPE%/notes.txt""#,
+            r#"unlink /tmp/"%DCG_ESCAPE%/notes.txt""#,
+            "unlink /tmp/%DCG_ESCAPE%/notes.txt",
+            r#"unlink "/tmp/!DCG_ESCAPE!/notes.txt""#,
+            "unlink /tmp/!DCG_ESCAPE!/notes.txt",
+            r#"unlink "/tmp/"^.^."/Users/user/notes.txt""#,
+            "unlink /tmp/^.^./Users/user/notes.txt",
+            r#"unlink "/tmp/.. /Users/user/notes.txt""#,
+            r#"unlink "/tmp/.../Users/user/notes.txt""#,
+            "unlink /tmp/.../Users/user/notes.txt",
+            r#"'unlink' "/tmp/cache./notes.txt""#,
+            "unlink /tmp/cache./notes.txt",
+        ] {
+            assert!(
+                unlink_command_for_pattern_matching(command, ShellDialect::Posix)
+                    .is_some_and(|command| command.safe),
+                "known POSIX literal operand: {command}"
+            );
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "unlink");
+        }
+        for command in [
+            "'unlink' /tmp/../etc/passwd",
+            "'unlink' /tmp/\"../etc/passwd\"",
+            r"unlink /tmp/cache\..\..\Users/user/notes.txt",
+            r#""unlink" "/tmp/cache/..\..\Users/user/notes.txt""#,
+            r"'unlink' '/tmp/cache/..\..\Users/user/notes.txt'",
+            "'unlink' \"$TMPDIR/scratch\"",
+            "'unlink' /tmp/scratch /etc/passwd",
+            "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "unlink");
+        }
+        assert_no_safe_match(&pack, "'unlink'>/etc/passwd /tmp/scratch");
     }
 
     #[test]
@@ -7586,6 +7961,47 @@ mod tests {
     }
 
     #[test]
+    fn unspaced_append_to_dynamic_path_is_not_a_truncation_575() {
+        // The dynamic-path rule ignored `>> "$LOG"` but read `>>"$LOG"` as a
+        // truncating `>` whose target began with the second `>`.
+        let pack = create_pack();
+        let dynamic_path = pack
+            .destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some("redirect-truncate-dynamic-path"))
+            .expect("redirect-truncate-dynamic-path rule");
+        for cmd in [
+            "echo done >>\"$LOG\"",
+            "echo done >>$LOG",
+            "echo done 2>>\"$LOG\"",
+            "echo done 2>>$LOG",
+            "echo done &>>\"$LOG\"",
+            "echo done >>\"$HOME/notes.txt\"",
+            "echo done >>${LOG}",
+            "echo done >>`pwd`/log",
+        ] {
+            assert!(
+                !dynamic_path.regex.is_match(cmd),
+                "append must not be read as a truncating redirect: {cmd:?}"
+            );
+        }
+        // Truncating spellings of the same targets still deny, including a
+        // truncation that shares the line with an append.
+        for cmd in [
+            "echo done >\"$LOG\"",
+            "echo done > \"$LOG\"",
+            "echo done >|\"$LOG\"",
+            "echo done 2>\"$LOG\"",
+            "echo done &>\"$LOG\"",
+            "echo done >$LOG",
+            "echo a >>/tmp/x >\"$LOG\"",
+            "echo a >\"$LOG\" >>/tmp/x",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-dynamic-path");
+        }
+    }
+
+    #[test]
     fn append_into_git_internals_is_denied_issue_457() {
         // The truncating spelling of each of these was already denied; the
         // appending one reaches the same end state and was allowed. Appending
@@ -8270,6 +8686,242 @@ mod tests {
             assert!(
                 pack.check(cmd).is_some(),
                 "Trash carve-out must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_reads_quoted_separators_as_file_name_bytes_issue_552() {
+        // GitHub #552: inside a quoted operand `&`, `;` and `|` are bytes of
+        // the file name, not separators. The home-subtree rescues excluded
+        // them from their quoted token classes, so the move allowed with `x`,
+        // `(` or `#` in the name was denied with `&`.
+        let pack = create_pack();
+        for cmd in [
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ; b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a | b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a b.pdf" "/home/tester/Downloads/c & d.pdf""#,
+            r"mv '/home/tester/Downloads/a & b.pdf' '/home/tester/Downloads/c.pdf'",
+            r"mv '/home/tester/Downloads/a;b|c&d.pdf' /home/tester/Downloads/e.pdf",
+            // The reported real-world name, apostrophe included.
+            r#"mv "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Kevin & Linh's Wedding - A Comprehensive Guide.pdf" "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Archive/""#,
+            r#"mv -v "~/Documents/a&b.txt" "~/Documents/a;b.txt" ~/Documents/dest/"#,
+            // The other punctuation the report found allowed stays allowed.
+            r#"mv "/home/tester/Downloads/a x b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ( b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ) b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ' b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a , b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a # b.pdf" "/home/tester/Downloads/c.pdf""#,
+            // `mv-relative-into-home` shares the destination alternation and
+            // reads its quoted source the same way.
+            r#"mv "a & b.pdf" /home/tester/Downloads/c.pdf"#,
+            r#"mv a.pdf "/home/tester/Downloads/c | d.pdf""#,
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator inside a home-subtree operand is file-name data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_still_ends_at_unquoted_separators_issue_552() {
+        // The #552 fix must not widen the rescue: an unquoted `;`, `|` or `&`
+        // still ends the mv, every home-root, dotfile and `..` boundary still
+        // holds inside quotes, and dynamic or escaped text still withholds it.
+        let pack = create_pack();
+        for cmd in [
+            // A second segment after a real separator is never rescued.
+            "mv ~/Downloads/a ~/Downloads/b; rm -rf ~",
+            "mv ~/Downloads/a & mv /etc /tmp/x",
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf" & rm -rf ~"#,
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf"; mv /etc /tmp/x"#,
+            r#"mv "/home/tester/Downloads/a" & "/home/tester/Downloads/b""#,
+            r#"mv "/home/tester/Downloads/a"&"/home/tester/Downloads/b" "/home/tester/Downloads/c""#,
+            // An unquoted separator in the home-root user name is a separator
+            // too. The regex used to read each of these as one rescued mv;
+            // only the segmenter kept them from being exempt.
+            "mv /home/x;/Documents/a/b /home/u/Documents/c",
+            "mv /home/a&b/Docs/x/y /home/a&b/Docs/z",
+            "mv /home/a|b/Docs/x/y /home/a/Docs/z",
+            // Home roots, top-level home directories, dotfile trees and `..`
+            // stay gated when the name carries a quoted separator.
+            r#"mv "/home/tester & x" "/home/tester/Downloads/c""#,
+            r#"mv "/home/tester/Downloads & x" "/home/tester/Docs/y""#,
+            r#"mv "/home/tester/Downloads/x" "/home/tester/.ssh""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/.ssh/authorized_keys""#,
+            r#"mv "/home/tester/.ssh/id_rsa & x" "/home/tester/Downloads/c""#,
+            r#"mv "/home/tester/Downloads/a & b/../../.ssh/k" "/home/tester/Downloads/c""#,
+            r#"mv a.pdf "/home/tester/.ssh/x & y""#,
+            r#"mv ../a.pdf "/home/tester/Downloads/c & d.pdf""#,
+            r#"mv .ssh/id_rsa "/home/tester/Downloads/c & d""#,
+            // Leaving the home tree is still the relocate half of the bypass.
+            r#"mv "/home/tester/Downloads/a & b.pdf" /tmp/x"#,
+            // Expansion after a quoted separator is still seen.
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/$(rm -rf ~)""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/`id`""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/$USER""#,
+            // A backslash anywhere withholds the rescue: with one, a quote can
+            // be escaped and the regex could no longer track where quoting
+            // ends. `mv-dynamic-path` treats every in-path escape as
+            // unverifiable (#356), so the escaped spelling stays denied too.
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/c\" ; rm -rf ~ ; \"""#,
+            r"mv /home/tester/Downloads/a\ \&\ b.pdf /home/tester/Downloads/c.pdf",
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "home-subtree rescue must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_withholds_the_rescue_on_brace_expansion() {
+        // Bash expands an unquoted brace list before mv runs, so the `..` and
+        // dotfile checks on the written token never see the real operands:
+        // `~/{..,a}/{..,b}/etc` is `~/../../etc ~/../b/etc ~/a/../etc
+        // ~/a/b/etc`, and the move of `/etc` was allowed while the spelled-out
+        // `mv ~/../../etc ~/Documents/x` was denied.
+        let pack = create_pack();
+        for cmd in [
+            "mv ~/{..,a}/{..,b}/etc ~/Documents/x",
+            "mv /home/tester/{..,x}/{..,y}/opt/homebrew /home/tester/Documents/x",
+            "mv ~/{Documents,.ssh}/id_rsa ~/Documents/y",
+            "mv ~/Documents/a ~/{Documents,.ssh}",
+            "mv /home/{tester,root}/Documents/a/b /home/tester/Documents/c",
+            "mv {..,a}/{..,b}/x /home/tester/Documents/y",
+            "mv a.md ~/Documents/{..,x}/{..,y}/{..,z}/etc/cron.d",
+            // The accepted cost: an ordinary brace list loses the rescue too
+            // and needs its operands spelled out (or quoted, if literal).
+            "mv ~/Documents/{a,b}.txt ~/Documents/dir/",
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "brace expansion must not ride the home-subtree rescue: {cmd}"
+            );
+        }
+        // Inside quotes a brace is a literal byte, and a lone `}` never
+        // starts an expansion.
+        for cmd in [
+            r#"mv "/home/tester/Documents/{draft}.txt" "/home/tester/Documents/final.txt""#,
+            r"mv '/home/tester/Documents/a{1,2}.txt' /home/tester/Documents/dir/",
+            r#"mv "a{..,b}.md" /home/tester/Documents/x.md"#,
+            "mv ~/Documents/a} ~/Documents/b",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a literal brace inside a home-subtree operand is file-name data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_separator_cannot_hide_a_later_operand_issue_552_follow_up() {
+        // Rules that stay inside one command scan with `[^|;&]*`, which
+        // stopped at a quoted or escaped separator: every operand after it was
+        // invisible, so the canonical relocate-then-delete bypass and
+        // `find / -delete` were allowed whenever an earlier operand was named
+        // `a;b`. Each command below is denied with a quoted space instead.
+        let pack = create_pack();
+        for (cmd, rule) in [
+            (r#"mv "a & b" /etc /tmp/x"#, "mv-sensitive-source-root-home"),
+            (r#"mv "a & b" /etc/hosts"#, "mv-sensitive-source-root-home"),
+            (
+                r#"mv "a;b" ~/Documents /tmp/x"#,
+                "mv-sensitive-source-root-home",
+            ),
+            (
+                r#"mv -- "a & b" /home/tester /tmp/x"#,
+                "mv-sensitive-source-root-home",
+            ),
+            (r#"mv "a & b" $X /tmp/y"#, "mv-dynamic-path"),
+            (r#"find "a;b" / -delete"#, "find-delete-root-home"),
+            (
+                r#"find "a|b" /home/tester -delete"#,
+                "find-delete-root-home",
+            ),
+            (r"find a\;b / -delete", "find-delete-root-home"),
+            (
+                r#"cp -a "a & b" /etc /tmp/x && rm -rf /tmp/x"#,
+                "cp-sensitive-then-delete",
+            ),
+            (
+                r#"ln -s "a & b" /etc /tmp/x && rm -rf /tmp/x/."#,
+                "ln-symlink-sensitive-then-delete",
+            ),
+            (
+                r#"rsync -a "a;b" /etc/ /tmp/d/ && rm -rf /tmp/d"#,
+                "rsync-sensitive-then-delete",
+            ),
+            (
+                r#"rsync -a --delete "a & b" /tmp/src/ /etc/"#,
+                "rsync-delete-sensitive-dest",
+            ),
+            (r#"dd "if=a&b" of=/etc/hosts"#, "dd-overwrite-root-home"),
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, rule);
+        }
+        // Harmless commands carrying the same quoted separators stay allowed:
+        // the masked view only lets a scan read its own command further.
+        for cmd in [
+            r#"mv "a & b" c"#,
+            r#"mv "a;b" /tmp/x/"#,
+            r#"mv "/home/tester/Documents/a & b" ~/Documents/x ~/Documents/y"#,
+            r#"mv "a & b" /home/tester/Documents/y"#,
+            r#"cp -a "a & b" /tmp/x && rm -rf /tmp/x"#,
+            r#"rsync -a "a & b" /tmp/dst/"#,
+            r#"find . -name "a;b" -print"#,
+            r#"grep "a|b" file"#,
+            r#"echo "x;y" > /tmp/out"#,
+            r"find /tmp/build -name x -exec rm {} \;",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator in a harmless command must stay data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn trash_rescues_read_quoted_separators_and_refuse_brace_expansion() {
+        // #552 for the Trash soft-delete: a quoted `&`, `;` or `|` is a
+        // file-name byte, exactly like the space that was already allowed.
+        let pack = create_pack();
+        for cmd in [
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/"#,
+            r"mv '/Users/u/Documents/a;b.txt' '/Users/u/.Trash/'",
+            r#"mv "/home/u/docs/a | b.txt" /home/u/.local/share/Trash/"#,
+            r#"mv "a & b" ~/.Trash/"#,
+            r#"mv "/Users/u/Documents/{a,b}.txt" ~/.Trash/"#,
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator in a Trash move is file-name data: {cmd}"
+            );
+        }
+        // An unquoted brace list expands past the `..` guard before mv runs,
+        // and the quote-aware reading must not let a real separator through.
+        for cmd in [
+            "mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/",
+            "mv /Users/{u,root}/Documents/x ~/.Trash/",
+            "mv ~/Documents/x ~/.Trash/{..,a}",
+            r#"mv ~/D/a" "/Users/u/D/b & rm -rf ~ & x" ~/.Trash/"#,
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/ & rm -rf ~"#,
+            r#"mv "/Users/u/Documents/../../../etc & x" ~/.Trash/"#,
+            r#"mv "$HOME/a & b" ~/.Trash/"#,
+            r#"mv "/etc/a & b" ~/.Trash/"#,
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "the Trash rescue must stay bounded: {cmd}"
             );
         }
     }
@@ -9265,6 +9917,228 @@ mod tests {
         }
     }
 
+    // The unfiltered implementation before #555. Keep this independent of the
+    // context facts so the differential tests catch an over-eager exclusion.
+    fn reference_rm_segment_receives_automated_stdin(
+        command: &str,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+        posix_pipeline_group_is_active(command, segment_start)
+            || prior_posix_exec_redirects_stdin(command, segment_start)
+    }
+
+    #[test]
+    fn stdin_context_matches_legacy_at_every_source_boundary_issue_555() {
+        for command in [
+            "",
+            "ls -la",
+            "rm -ri ./tree",
+            "yes | rm -ri ./tree",
+            "printf y |& rm -rI ./tree",
+            "true || rm -ri ./tree",
+            "printf '%s' '|'; rm -ri ./tree",
+            r"printf \|; rm -ri ./tree",
+            "yes | { echo ready; rm -ri ./tree; }",
+            "yes | ( echo ready; rm -ri ./tree )",
+            "yes | while true; do rm -ri ./tree; break; done",
+            "yes | if true; then rm -ri ./tree; else true; fi",
+            "yes | { # }\n rm -ri ./tree; }",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "yes | { cat <<-'EOF'\n\t}\n\tEOF\nrm -ri ./tree; }",
+            "printf y | { cat; }; rm -ri ./tree",
+            "printf '%s' \"$(yes | { rm -ri ./tree; })\"",
+            "printf '%s' `yes | rm -ri ./tree`",
+            "exec < answers.txt; rm -ri ./tree",
+            "exec 0<answers.txt; rm -rI ./tree",
+            "'exec' 0<answers.txt; rm -ri ./tree",
+            "\"/bin/exec\" 0<answers.txt; rm -ri ./tree",
+            r"\exec 0<answers.txt; rm -ri ./tree",
+            "e''xec 0<answers.txt; rm -ri ./tree",
+            "FOO=bar exec <answers.txt; rm -ri ./tree",
+            "exec 0<&3; rm -ri ./tree",
+            "exec 0<&-; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "exec <>answers.txt; rm -ri ./tree",
+            "(exec < answers.txt; true); rm -ri ./tree",
+            "(exec < answers.txt; rm -ri ./tree); true",
+            "echo 'exec <answers.txt'; rm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "python3 - <<'PY'\nvalue = 'λ雪'\nprint(value)\nPY\nrm -ri ./tree",
+            "printf '%s' '雪'\r\nexec <answers.txt\r\nrm -ri ./tree",
+            "yes | { cat <<'EOF'\nunterminated body\nrm -ri ./tree",
+            "printf '%s' \"$(exec <answers; rm -ri ./tree",
+            "Get-Content answers.txt | Remove-Item -Recurse ./tree",
+            "type answers.txt | del tree",
+            "echo ^| literal & del tree",
+        ] {
+            let context = RmStdinContext::new(command);
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                // Walk backwards as well as querying offsets outside the
+                // source: callers do not promise monotonic segment order.
+                for offset in (0..=command.len() + 1).rev() {
+                    if offset < command.len() && !command.is_char_boundary(offset) {
+                        continue;
+                    }
+                    let expected =
+                        reference_rm_segment_receives_automated_stdin(command, offset, dialect);
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(offset, dialect),
+                        expected,
+                        "context: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, offset, dialect),
+                        expected,
+                        "standalone: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_context_preserves_multiline_interactive_verdicts_issue_555() {
+        use std::fmt::Write as _;
+
+        for lines in [1, 40, 300] {
+            let mut body = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(body, "value_{index} = {index}").expect("write fixture line");
+            }
+            body.push_str("PY\n");
+            for (prefix, suffix, automated) in [
+                ("", "rm -ri ./tree", false),
+                ("yes | { ", "rm -ri ./tree; }", true),
+                ("exec 0<answers; ", "rm -ri ./tree", true),
+            ] {
+                let command = format!("{prefix}{body}{suffix}");
+                let context = RmStdinContext::new(&command);
+                for segment in crate::packs::split_command_segments(&command) {
+                    let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(start, ShellDialect::Posix),
+                        reference_rm_segment_receives_automated_stdin(
+                            &command,
+                            start,
+                            ShellDialect::Posix,
+                        ),
+                        "lines={lines}, prefix={prefix:?}, start={start}",
+                    );
+                }
+                let rm_start = command.rfind("rm -ri").expect("explicit final rm");
+                assert_eq!(
+                    context.segment_receives_automated_stdin(rm_start, ShellDialect::Posix),
+                    automated,
+                );
+                match parse_rm_command(&command) {
+                    RmParseDecision::Allow if !automated => {}
+                    RmParseDecision::Deny(hit) if automated => {
+                        assert_eq!(hit.pattern_name, RM_RECURSIVE_GENERAL_NAME);
+                        assert_eq!(hit.severity, Severity::High);
+                    }
+                    decision => panic!(
+                        "interactive verdict changed: lines={lines}, automated={automated}, \
+                         decision={decision:?}"
+                    ),
+                }
+            }
+            let destructive = format!("{body}rm -rf /");
+            assert!(matches!(
+                parse_rm_command(&destructive),
+                RmParseDecision::Deny(hit) if hit.pattern_name == RM_RF_ROOT_HOME_NAME
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "paired in-process legacy/context timing; run in release mode with --nocapture"]
+    fn paired_stdin_provenance_benchmark_issue_555() {
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for lines in [40, 300, 1_000] {
+            let mut command = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(command, "value_{index} = {index}").expect("write fixture line");
+            }
+            command.push_str("print('ready')\nPY");
+            let offsets: Vec<_> = crate::packs::split_command_segments(&command)
+                .iter()
+                .map(|segment| segment.as_ptr() as usize - command.as_ptr() as usize)
+                .collect();
+            let reference = || {
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        reference_rm_segment_receives_automated_stdin(
+                            black_box(&command),
+                            offset,
+                            ShellDialect::Posix,
+                        )
+                    })
+                    .count()
+            };
+            let candidate = || {
+                let context = RmStdinContext::new(black_box(&command));
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
+                    })
+                    .count()
+            };
+            assert_eq!(reference(), candidate());
+            let mut reference_ns = Vec::new();
+            let mut candidate_ns = Vec::new();
+            for iteration in 0..7 {
+                for use_reference in [iteration % 2 == 0, iteration % 2 != 0] {
+                    let start = Instant::now();
+                    let result = if use_reference {
+                        black_box(reference())
+                    } else {
+                        black_box(candidate())
+                    };
+                    let elapsed = start.elapsed().as_nanos();
+                    assert_eq!(result, 0);
+                    if use_reference {
+                        reference_ns.push(elapsed);
+                    } else {
+                        candidate_ns.push(elapsed);
+                    }
+                }
+            }
+            reference_ns.sort_unstable();
+            candidate_ns.sort_unstable();
+            let reference_ns = reference_ns[reference_ns.len() / 2];
+            let candidate_ns = candidate_ns[candidate_ns.len() / 2];
+            eprintln!(
+                "stdin_provenance lines={lines} segments={} legacy_p50_us={:.3} \
+                 context_p50_us={:.3} speedup={:.2}x",
+                offsets.len(),
+                reference_ns as f64 / 1_000.0,
+                candidate_ns as f64 / 1_000.0,
+                reference_ns as f64 / candidate_ns.max(1) as f64,
+            );
+        }
+    }
+
     #[test]
     fn test_rm_parser_normalizes_segment_local_wrappers_and_executables() {
         for command in [
@@ -9290,6 +10164,56 @@ mod tests {
             "busybox nice rm -r ./tree",
         ] {
             assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn automated_stdin_candidates_preserve_full_reader_results() {
+        let large = format!(
+            "python3 - <<'EOF'\n{}EOF\nrm -ri ./tree",
+            "print('ordinary data')\n".repeat(300)
+        );
+        let cases = [
+            large.as_str(),
+            "yes | { echo x; rm -ri ./tree; }",
+            "yes | (echo x; rm -ri ./tree)",
+            "yes | if true; then rm -ri ./tree; fi",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "exec 0<answers.txt; rm -ri ./tree",
+            "'exec' <answers.txt; rm -ri ./tree",
+            "exec <<<yes; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "(exec <answers.txt; true); rm -ri ./tree",
+            "printf '| exec <'\nrm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "echo café && rm -ri ./tree",
+        ];
+        // Compare to the incumbent readers at every extracted segment,
+        // including heredoc lines and nested segments. This catches a
+        // candidate gate hiding a shape those readers already recognized.
+        for command in cases {
+            for segment in crate::packs::split_command_segments(command) {
+                let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                let prefix = command[..start].trim_end();
+                let direct =
+                    prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||"));
+                for dialect in [
+                    ShellDialect::Posix,
+                    ShellDialect::Unknown,
+                    ShellDialect::Cmd,
+                    ShellDialect::PowerShell,
+                ] {
+                    let incumbent = direct
+                        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+                            && (posix_pipeline_group_is_active(command, start)
+                                || prior_posix_exec_redirects_stdin(command, start)));
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, start, dialect),
+                        incumbent,
+                        "{dialect:?} at {start}: {command}"
+                    );
+                }
+            }
         }
     }
 
