@@ -1,0 +1,61 @@
+schema_version: 2
+name: playbook
+description: Auto-generated from cass-memory reflections
+metadata:
+  createdAt: 2026-11-11T16:59:30.953Z
+  totalReflections: 0
+  totalSessionsProcessed: 0
+deprecatedPatterns: []
+bullets:
+  - id: b-mwcd6d55-1wvgq2
+    content: "A new dcg command-string runner needs COMMAND_STRING_RUNNERS, an arm
+      in command_string_runner_payloads AND the tier-1 trigger regex in
+      src/heredoc.rs; without the trigger the arm never runs. Put dcg probe
+      strings in a script file: the live hook blocks them in Bash."
+    category: general
+    kind: workflow_rule
+    type: rule
+    isNegative: false
+    scope: workspace
+    source: learned
+    tags: []
+    state: draft
+    maturity: candidate
+    createdAt: 2026-11-11T16:59:30.953Z
+    updatedAt: 2026-11-11T16:59:30.953Z
+    sourceSessions:
+      - manual-cli
+    sourceAgents:
+      - unknown
+    helpfulCount: 0
+    harmfulCount: 0
+    feedbackEvents: []
+    deprecated: false
+    pinned: false
+    confidenceDecayHalfLifeDays: 90
+  - id: b-mwcd6d55-v7sb1d
+    content: "dcg fork: adding a pack needs PACK_ENTRIES row+count, regenerated docs
+      (generate_pack_docs --ignored), README pack id, UPDATE_GOLDEN_ARTIFACTS=1;
+      write Rust test text with Write/Edit since dcg blocks heredocs holding
+      destructive strings"
+    category: general
+    kind: workflow_rule
+    type: rule
+    isNegative: false
+    scope: workspace
+    source: learned
+    tags: []
+    state: draft
+    maturity: candidate
+    createdAt: 2026-11-11T16:59:30.953Z
+    updatedAt: 2026-11-11T16:59:30.953Z
+    sourceSessions:
+      - manual-cli
+    sourceAgents:
+      - unknown
+    helpfulCount: 0
+    harmfulCount: 0
+    feedbackEvents: []
+    deprecated: false
+    pinned: false
+    confidenceDecayHalfLifeDays: 90
